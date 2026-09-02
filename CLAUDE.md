@@ -9,9 +9,11 @@ Examples are developed and validated on an **NVIDIA GeForce RTX 5060**
 (Blackwell, compute capability **12.0 / sm_120**).
 
 - Requires **CUDA Toolkit 12.8+** (the first release with sm_120 support).
-- `CMAKE_CUDA_ARCHITECTURES` defaults to `native`, which resolves to `120` on
-  that machine. Override with `-DCMAKE_CUDA_ARCHITECTURES=120` when
-  cross-compiling or when `native` detection is unavailable.
+- `CMAKE_CUDA_ARCHITECTURES` defaults to the local GPU's architecture
+  (`native` on CMake ≥ 3.24, `nvidia-smi` detection on older CMake), which
+  resolves to `120` on that machine. Override with
+  `-DCMAKE_CUDA_ARCHITECTURES=120` when cross-compiling or when detection is
+  unavailable.
 - Code may rely on Blackwell-specific features (e.g. TMA, tcgen05 MMA); it is
   not expected to run on older architectures without adaptation.
 

@@ -9,11 +9,13 @@ Each example is a standalone program under `examples/`; dropping in a new
 
 ## Requirements
 
-- CMake ≥ 3.24 and a C++17 host compiler
+- CMake ≥ 3.18 and a C++17 host compiler
 - **CUDA Toolkit 12.8+** (required for all examples — CuTe headers include
   CUDA runtime headers unconditionally)
 - Target GPU: **NVIDIA RTX 5060** (Blackwell, sm_120). `CMAKE_CUDA_ARCHITECTURES`
-  defaults to `native`; override with `-DCMAKE_CUDA_ARCHITECTURES=120` if needed.
+  defaults to the local GPU's architecture (`native` on CMake ≥ 3.24, detected
+  via `nvidia-smi` on older CMake); override with
+  `-DCMAKE_CUDA_ARCHITECTURES=120` if needed.
 
 Without a CUDA toolkit, configuration still succeeds but no example targets
 are generated.
