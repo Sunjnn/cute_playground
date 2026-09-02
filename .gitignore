@@ -1,0 +1,9 @@
+build/
+cmake-build-*/
+.cache/
+.vscode/
+compile_commands.json
+*.o
+*.a
+*.so
+*.dylib
