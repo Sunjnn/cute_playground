@@ -24,6 +24,7 @@ Checks: >
   -misc-include-cleaner,
   -misc-use-internal-linkage,
   -misc-no-recursion,
+  -misc-header-include-cycle,
   modernize-*,
   -modernize-use-trailing-return-type,
   -modernize-avoid-c-arrays,
