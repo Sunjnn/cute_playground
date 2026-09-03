@@ -1,0 +1,1 @@
+void softmax(int m, int n, float *dIn, int ldIn, float *dOut, int ldOut);
