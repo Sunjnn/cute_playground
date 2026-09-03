@@ -44,6 +44,14 @@ if(CMAKE_CUDA_COMPILER)
   enable_language(CUDA)
   set(CMAKE_CUDA_STANDARD 17)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+  # libcu++/CCCL headers #error out when MSVC's traditional preprocessor is
+  # used, and nvcc's host pass (cl.exe) defaults to it. -Xcompiler forwards
+  # the flag to that host compiler only; cicc (device code) never sees it.
+  # /utf-8 additionally silences the C4819 codepage warnings cl.exe emits for
+  # UTF-8 comments in CUDA's own headers on non-UTF-8 system locales.
+  add_compile_options(
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
   # clangd cannot expand nvcc's `--options-file` response files, so the CUDA
   # include paths (CUTLASS/CuTe) would be invisible to the language server and
   # every `cute::` reference errors out. Keep them on the command line instead.

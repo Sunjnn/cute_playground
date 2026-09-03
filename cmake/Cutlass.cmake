@@ -34,8 +34,10 @@ if(CMAKE_CUDA_COMPILER)
   # clang-tidy) also sees the directory.
   # CUDAToolkit_INCLUDE_DIRS is a list; build the path from its first entry so
   # the result is a single well-formed -isystem flag rather than a stray token.
+  # nvcc only accepts the '='-joined form (-isystem=<dir>); the glued form
+  # (-isystem<dir>) works for clang/clangd but is rejected as unknown by nvcc.
   list(GET CUDAToolkit_INCLUDE_DIRS 0 cutlass_cuda_inc)
   target_compile_options(
     cutlass_cute
-    INTERFACE $<$<COMPILE_LANGUAGE:CUDA,CXX>:-isystem${cutlass_cuda_inc}/cccl>)
+    INTERFACE $<$<COMPILE_LANGUAGE:CUDA,CXX>:-isystem=${cutlass_cuda_inc}/cccl>)
 endif()
