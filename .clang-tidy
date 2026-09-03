@@ -3,6 +3,7 @@ Checks: >
   bugprone-*,
   -bugprone-easily-swappable-parameters,
   -bugprone-exception-escape,
+  -bugprone-reserved-identifier,
   cppcoreguidelines-*,
   -cppcoreguidelines-avoid-magic-numbers,
   -cppcoreguidelines-owning-memory,
@@ -35,6 +36,7 @@ Checks: >
   -readability-identifier-length,
   -readability-implicit-bool-conversion,
   -readability-math-missing-parentheses,
+  -readability-uppercase-literal-suffix,
   -llvm-header-guard,
 
 WarningsAsErrors: ''
