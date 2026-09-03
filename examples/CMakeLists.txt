@@ -7,29 +7,30 @@ if(NOT CMAKE_CUDA_COMPILER)
   return()
 endif()
 
-# One executable per example file.
-#   *.cpp -> host-only examples (compiled by the host compiler)
-#   *.cu  -> CUDA examples (compiled by nvcc)
+# One executable per example subdirectory. A single example may span several
+# translation units (e.g. softmax/ = main.cpp + softmax.cu + softmax.cuh), so
+# every .cpp (host) and .cu (CUDA) file in the folder is compiled into one
+# target named after the folder. Headers are found via the folder include dir.
 
+# Discover example folders from their sources and group the sources per folder.
 file(
-  GLOB host_examples
+  GLOB example_srcs
   RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}
-  CONFIGURE_DEPENDS *.cpp)
-foreach(src ${host_examples})
-  get_filename_component(name ${src} NAME_WE)
-  add_executable(${name} ${src})
-  target_link_libraries(${name} PRIVATE cutlass::cute)
+  CONFIGURE_DEPENDS */*.cpp */*.cu)
+
+set(example_dirs "")
+foreach(src ${example_srcs})
+  get_filename_component(dir ${src} DIRECTORY)
+  list(APPEND example_dirs ${dir})
+  list(APPEND example_srcs_${dir} ${src})
 endforeach()
+list(REMOVE_DUPLICATES example_dirs)
 
-file(
-  GLOB cuda_examples
-  RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}
-  CONFIGURE_DEPENDS *.cu)
-foreach(src ${cuda_examples})
-  get_filename_component(name ${src} NAME_WE)
-  add_executable(${name} ${src})
-  target_link_libraries(${name} PRIVATE cutlass::cute)
+foreach(dir ${example_dirs})
+  add_executable(${dir} ${example_srcs_${dir}})
+  target_link_libraries(${dir} PRIVATE cutlass::cute)
+  target_include_directories(${dir} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/${dir})
   target_compile_options(
-    ${name} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr
+    ${dir} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr
                     --expt-extended-lambda>)
 endforeach()
