@@ -27,6 +27,12 @@ ReferenceAlignment: Right
 
 IncludeBlocks: Regroup
 IncludeCategories:
+  # A source file's own header (e.g. `softmax.cuh` for `softmax.cu`) leads the
+  # include block. clang-format's built-in main-header detection does not map
+  # .cu -> .cuh, so pin local .cuh headers to their own top-priority category.
+  - Regex: '^".*\.cuh"'
+    Priority: 1
+    SortPriority: 1
   - Regex: '^<.*>'
     Priority: 2
     SortPriority: 2
