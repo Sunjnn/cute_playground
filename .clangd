@@ -1,0 +1,9 @@
+# compile_commands.json contains raw nvcc command lines; clangd parses them
+# as clang flags, so strip the nvcc-only options it rejects.
+CompileFlags:
+  CompilationDatabase: build
+  Remove:
+    - -forward-unknown-to-host-compiler
+    - --expt-relaxed-constexpr
+    - --expt-extended-lambda
+    - --generate-code=*

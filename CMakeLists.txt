@@ -44,6 +44,10 @@ if(CMAKE_CUDA_COMPILER)
   enable_language(CUDA)
   set(CMAKE_CUDA_STANDARD 17)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+  # clangd cannot expand nvcc's `--options-file` response files, so the CUDA
+  # include paths (CUTLASS/CuTe) would be invisible to the language server and
+  # every `cute::` reference errors out. Keep them on the command line instead.
+  set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES OFF)
   message(STATUS "CUDA found: ${CMAKE_CUDA_COMPILER} "
                  "(archs: ${CMAKE_CUDA_ARCHITECTURES})")
 else()
