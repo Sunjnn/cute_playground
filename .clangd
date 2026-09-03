@@ -7,3 +7,4 @@ CompileFlags:
     - --expt-relaxed-constexpr
     - --expt-extended-lambda
     - --generate-code=*
+    - -arch=*
