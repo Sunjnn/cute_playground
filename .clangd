@@ -8,3 +8,10 @@ CompileFlags:
     - --expt-extended-lambda
     - --generate-code=*
     - -arch=*
+
+# `-x cu` makes clangd run a CUDA device pass, and clang forbids `__host__`-only
+# deduction guides there. CCCL's `cuda/std/string_view` declares exactly those,
+# but nvcc's EDG frontend accepts them, so this diagnostic is a false positive.
+Diagnostics:
+  Suppress:
+    - deduction_guide_target_attr
