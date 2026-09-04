@@ -57,11 +57,6 @@ constexpr size_t kImplCount = 2;
 constexpr array<Impl, kImplCount> kImpls{
     {Impl{"softmax", softmax}, Impl{"softmax_cub", softmax_cub}}};
 
-// The library baseline runs first: the CuTe kernel builds its smem->gmem store from a cp.async
-// copy atom, so it is expected to raise a sticky CUDA fault, after which every later CUDA call in
-// the process fails. Running it last keeps the baseline's numbers intact.
-constexpr array<size_t, kImplCount> kRunOrder{{1, 0}};
-
 struct Result {
   bool checked = false;
   bool verified = false;
@@ -172,8 +167,8 @@ array<Result, kImplCount> run_all(
     device_vector<float> &dIn,
     device_vector<float> &dOut) {
   auto results = array<Result, kImplCount>{};
-  for (auto index : kRunOrder) {
-    results[index] = run_impl(kImpls[index], prob, hIn, hOut, dIn, dOut);
+  for (auto i = size_t{0}; i < kImplCount; ++i) {
+    results[i] = run_impl(kImpls[i], prob, hIn, hOut, dIn, dOut);
   }
   return results;
 }
