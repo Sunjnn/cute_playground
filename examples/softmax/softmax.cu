@@ -3,7 +3,6 @@
 #include <cccl/thrust/device_vector.h>
 #include <cccl/thrust/host_vector.h>
 #include <cuda_runtime.h>
-#include <iostream>
 #include <stdexcept>
 
 #include "cute/arch/copy.hpp"
