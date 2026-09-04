@@ -22,6 +22,7 @@ sed -E \
     -e 's/ --expt-extended-lambda//g' \
     -e 's/ --generate-code=[^" ]*//g' \
     -e 's/ -arch=[^" ]*//g' \
+    -e 's/ -Xcompiler=[^" ]*//g' \
     -e 's/ -x cu / -x cuda /g' \
     build/compile_commands.json >"$db_dir/compile_commands.json"
 
