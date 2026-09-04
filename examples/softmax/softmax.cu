@@ -8,13 +8,13 @@
 
 #include "cute/arch/copy.hpp"
 #include "cute/arch/copy_sm80.hpp"
-#include "cute/tensor.hpp"  // IWYU pragma: keep
 #include "cute/container/array_subbyte.hpp"
 #include "cute/int_tuple.hpp"
 #include "cute/layout.hpp"
 #include "cute/numeric/integral_constant.hpp"
 #include "cute/pointer.hpp"
 #include "cute/swizzle_layout.hpp"
+#include "cute/tensor.hpp" // IWYU pragma: keep
 #include "cute/tensor_impl.hpp"
 #include "cute/underscore.hpp"
 #include "cutlass/uint128.h"
@@ -25,11 +25,12 @@ using cute::clear;
 using cute::copy;
 using cute::Copy_Atom;
 using cute::cosize_v;
+using cute::cp_async_fence;
+using cute::cp_async_wait;
 using cute::Int;
 using cute::local_partition;
 using cute::local_tile;
 using cute::make_coord;
-using cute::make_fragment_like;
 using cute::make_gmem_ptr;
 using cute::make_layout;
 using cute::make_shape;
@@ -38,19 +39,12 @@ using cute::make_stride;
 using cute::make_tensor;
 using cute::make_tensor_like;
 using cute::make_tiled_copy;
-using cute::select;
 using cute::size;
-using cute::Step;
 using cute::SM80_CP_ASYNC_CACHEALWAYS;
-using cute::Tensor;
-using cute::cp_async_fence;
-using cute::cp_async_wait;
+using cute::Step;
 using cute::uint128_t;
 using cute::UniversalCopy;
-using std::cout;
 using std::runtime_error;
-using thrust::device_vector;
-using thrust::host_vector;
 
 namespace {
 
@@ -179,8 +173,8 @@ void softmax(int m, int n, float *dIn, int ldIn, float *dOut, int ldOut) {
 
   auto computeLayout = make_layout(make_shape(Int<1>{}, Int<128>{}));
 
-  dim3 dimBlock(size(computeLayout));
-  dim3 dimGrid(size(ceil_div(m, bM)));
+  const dim3 dimBlock(size(computeLayout));
+  const dim3 dimGrid(size(ceil_div(m, bM)));
 
   softmax_device<<<dimGrid, dimBlock>>>(
       probShape,
