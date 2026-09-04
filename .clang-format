@@ -26,20 +26,26 @@ PointerAlignment: Right
 ReferenceAlignment: Right
 
 IncludeBlocks: Regroup
+# Grouped by where a header resolves to, not by bracket style: `third_party/cutlass` is
+# spelled `"cute/..."` / `"cutlass/..."`, while the CUDA toolkit (`cuda_runtime.h`,
+# `cccl/thrust`, `cccl/cub`, `cudnn.h`) is spelled `<...>` and counts as system. The first
+# matching category wins, so the third_party rule must precede the generic `<...>` one.
 IncludeCategories:
-  # A source file's own header (e.g. `softmax.cuh` for `softmax.cu`) leads the
-  # include block. clang-format's built-in main-header detection does not map
-  # .cu -> .cuh, so pin local .cuh headers to their own top-priority category.
-  - Regex: '^".*\.cuh"'
-    Priority: 1
-    SortPriority: 1
-  - Regex: '^<.*>'
+  - Regex: '^[<"](cute|cutlass)/'
     Priority: 2
     SortPriority: 2
+  - Regex: '^<.*>'
+    Priority: 1
+    SortPriority: 1
   - Regex: '^".*"'
     Priority: 3
     SortPriority: 3
+# A source file's own header leads the include block, but clang-format only maps a file to
+# its main header when this regex is non-empty and matches the file name. The empty default
+# still covers `.cpp` through a built-in extension list that omits `.cu`, so without this a
+# `.cu` file's own `.cuh` would be sorted into the quoted block below the system headers.
 IncludeIsMainRegex: '$'
+IncludeIsMainSourceRegex: '$'
 SortIncludes: CaseInsensitive
 
 AllowShortFunctionsOnASingleLine: All

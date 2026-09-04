@@ -1,8 +1,3 @@
-#include "cub_softmax.cuh"
-#include "cudnn_softmax.cuh"
-#include "fmha_softmax.cuh"
-#include "softmax.cuh"
-
 #include <array>
 #include <cccl/thrust/copy.h>
 #include <cccl/thrust/device_vector.h>
@@ -20,6 +15,11 @@
 
 #include "cutlass/util/command_line.h"
 #include "cutlass/util/GPU_Clock.hpp"
+
+#include "cub_softmax.cuh"
+#include "cudnn_softmax.cuh"
+#include "fmha_softmax.cuh"
+#include "softmax.cuh"
 
 using cutlass::CommandLine;
 using std::array;
