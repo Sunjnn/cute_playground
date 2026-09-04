@@ -49,9 +49,13 @@ if(CMAKE_CUDA_COMPILER)
   # the flag to that host compiler only; cicc (device code) never sees it.
   # /utf-8 additionally silences the C4819 codepage warnings cl.exe emits for
   # UTF-8 comments in CUDA's own headers on non-UTF-8 system locales.
-  add_compile_options(
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+  # Guarded on MSVC because these are cl.exe flags: gcc parses `/Zc:...` as an
+  # input path and dies with "cannot specify '-o' ... with multiple files".
+  if(MSVC)
+    add_compile_options(
+      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
+      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+  endif()
   # clangd cannot expand nvcc's `--options-file` response files, so the CUDA
   # include paths (CUTLASS/CuTe) would be invisible to the language server and
   # every `cute::` reference errors out. Keep them on the command line instead.
