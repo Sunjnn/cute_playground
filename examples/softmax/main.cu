@@ -1,4 +1,6 @@
 #include "cub_softmax.cuh"
+#include "cudnn_softmax.cuh"
+#include "fmha_softmax.cuh"
 #include "softmax.cuh"
 
 #include <array>
@@ -52,10 +54,13 @@ struct Impl {
   SoftmaxFn run;
 };
 
-constexpr size_t kImplCount = 2;
+constexpr size_t kImplCount = 4;
 
 constexpr array<Impl, kImplCount> kImpls{
-    {Impl{"softmax", softmax}, Impl{"softmax_cub", softmax_cub}}};
+    {Impl{"softmax", softmax},
+     Impl{"softmax_cub", softmax_cub},
+     Impl{"softmax_fmha", softmax_fmha},
+     Impl{"softmax_cudnn", softmax_cudnn}}};
 
 struct Result {
   bool checked = false;
@@ -123,8 +128,8 @@ double benchmark(const Impl &impl, const Problem &prob, float *dIn, float *dOut)
   timer.start();
   for (auto i = 0; i < prob.iterations; ++i) {
     impl.run(prob.m, prob.n, dIn, prob.n, dOut, prob.n);
-    // softmax() synchronizes internally, softmax_cub() does not. Synchronizing here keeps both on
-    // the same footing instead of letting the asynchronous path overlap successive iterations.
+    // softmax() synchronizes internally, the other three do not. Synchronizing here keeps them on
+    // the same footing instead of letting the asynchronous paths overlap successive iterations.
     check(cudaStreamSynchronize(nullptr));
   }
   return static_cast<double>(timer.milliseconds()) * 1000.0 / prob.iterations;
@@ -183,7 +188,9 @@ string number(bool valid, const char *format, double value) {
 }
 
 void print_table(const Problem &prob, const array<Result, kImplCount> &results) {
-  // Both implementations read the input twice and write the output once.
+  // The GB/s column prices every implementation at two reads of the input and one write of the
+  // output, which is what the three kernels in this repository do and the least a two-pass softmax
+  // can cost.
   auto trafficBytes = 3.0 * static_cast<double>(prob.m) * static_cast<double>(prob.n) *
                       static_cast<double>(sizeof(float));
   auto softmaxUs = results[0].timed ? results[0].usPerIter : 0.0;

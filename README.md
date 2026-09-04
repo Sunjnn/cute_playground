@@ -16,6 +16,10 @@ Each example is a standalone program under `examples/`; dropping in a new
   defaults to the local GPU's architecture (`native` on CMake ≥ 3.24, detected
   via `nvidia-smi` on older CMake); override with
   `-DCMAKE_CUDA_ARCHITECTURES=120` if needed.
+- **cuDNN** (optional) — only the `softmax_cudnn` baseline needs it. Point
+  `-DCUDNN_ROOT=<dir>` at an install that is not next to the CUDA toolkit;
+  without one that baseline reports itself unavailable and everything else
+  still builds.
 
 Without a CUDA toolkit, configuration still succeeds but no example targets
 are generated.
@@ -32,6 +36,7 @@ cmake -B build && cmake --build build
 
 ```
 cmake/Cutlass.cmake     # wires up the cutlass::cute INTERFACE target
+cmake/Cudnn.cmake       # wires up the optional playground::cudnn INTERFACE target
 examples/               # one executable per .cpp / .cu file
 third_party/cutlass/    # CUTLASS git submodule (headers only)
 scripts/                # format.sh (clang-format), tidy.sh (clang-tidy)

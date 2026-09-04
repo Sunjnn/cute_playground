@@ -41,6 +41,12 @@ contributes no build targets and configure still succeeds.
 - **CUDA toolkit** — detected via `check_language(CUDA)`; when present,
   `CUDAToolkit_INCLUDE_DIRS` is added so `.cpp` examples find the real CUDA
   headers. See [Target Hardware](#target-hardware) for architecture flags.
+- **cuDNN** — optional, and only the `softmax_cudnn` baseline in
+  `examples/softmax` uses it. `cmake/Cudnn.cmake` searches the default paths
+  plus `-DCUDNN_ROOT=...` (an unpacked `.deb`, a pip wheel, a vendor drop) and
+  exposes the result as the `playground::cudnn` INTERFACE target. When nothing
+  is found the target defines `PLAYGROUND_NO_CUDNN` instead, `softmax_cudnn()`
+  becomes a stub that says so, and the build does not depend on cuDNN.
 
 ## Lint & Format
 

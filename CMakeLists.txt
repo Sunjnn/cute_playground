@@ -63,6 +63,7 @@ else()
 endif()
 
 include(Cutlass)
+include(Cudnn)
 
 option(BUILD_EXAMPLES "Build CuTe learning examples" ON)
 

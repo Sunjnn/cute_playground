@@ -28,7 +28,10 @@ list(REMOVE_DUPLICATES example_dirs)
 
 foreach(dir ${example_dirs})
   add_executable(${dir} ${example_srcs_${dir}})
-  target_link_libraries(${dir} PRIVATE cutlass::cute)
+  # playground::cudnn is linked everywhere, not just where cuDNN is used, to keep this loop
+  # uniform. It is an INTERFACE target that either supplies cuDNN's include path and library or
+  # defines PLAYGROUND_NO_CUDNN, so it costs nothing when the dependency is absent.
+  target_link_libraries(${dir} PRIVATE cutlass::cute playground::cudnn)
   target_include_directories(${dir} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/${dir})
   target_compile_options(
     ${dir} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr
