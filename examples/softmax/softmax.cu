@@ -41,7 +41,6 @@ using cute::make_tiled_copy;
 using cute::select;
 using cute::size;
 using cute::Step;
-using cute::sum;
 using cute::SM80_CP_ASYNC_CACHEALWAYS;
 using cute::Tensor;
 using cute::cp_async_fence;
@@ -111,7 +110,10 @@ __global__ void softmax_device(
     }
   }
 
-  auto thrSum = sum(tCrOut)[0];
+  auto thrSum = 0.0f;
+  for (auto i = 0; i < size(tCrOut); ++i) {
+    thrSum += tCrOut[i];
+  }
   auto warpSum = thrSum;
   for (auto offset = 16; offset > 0; offset /= 2) {
     warpSum += __shfl_xor_sync(0xffffffff, warpSum, offset);
