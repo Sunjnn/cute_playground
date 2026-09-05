@@ -10,14 +10,24 @@ set(CUDNN_ROOT
     ""
     CACHE PATH "Root of a cuDNN installation, containing include/ and lib/")
 
+# pip-wheel-style installs nest everything under a CUDA-versioned layer:
+# include/13.3/cudnn.h, lib/13.3/x64/cudnn.lib. Collect those subdirectories as
+# additional hint roots so both flat and versioned layouts are found.
+set(CUDNN_INCLUDE_HINTS)
+set(CUDNN_LIB_HINTS)
+if(CUDNN_ROOT)
+  file(GLOB CUDNN_INCLUDE_HINTS "${CUDNN_ROOT}/include/*")
+  file(GLOB CUDNN_LIB_HINTS "${CUDNN_ROOT}/lib/*" "${CUDNN_ROOT}/lib/*/x64")
+endif()
+
 find_path(
   CUDNN_INCLUDE_DIR cudnn.h
-  HINTS ${CUDNN_ROOT} ENV CUDNN_ROOT
+  HINTS ${CUDNN_ROOT} ${CUDNN_INCLUDE_HINTS} ENV CUDNN_ROOT
   PATH_SUFFIXES include)
 find_library(
   CUDNN_LIBRARY
   NAMES cudnn
-  HINTS ${CUDNN_ROOT} ENV CUDNN_ROOT
+  HINTS ${CUDNN_ROOT} ${CUDNN_LIB_HINTS} ENV CUDNN_ROOT
   PATH_SUFFIXES lib lib64)
 
 add_library(playground_cudnn INTERFACE)
