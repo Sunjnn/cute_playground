@@ -2,6 +2,7 @@
 
 #include <cccl/thrust/device_vector.h>
 #include <cccl/thrust/host_vector.h>
+#include <cmath>
 #include <cuda_runtime.h>
 #include <stdexcept>
 
@@ -76,7 +77,7 @@ __global__ void softmax_device(
   auto gIn = local_tile(mIn, ctaTiler, ctaCoord);
   auto gOut = local_tile(mOut, ctaTiler, ctaCoord);
 
-  __shared__ float sMem[cosize_v<SmemLayoutIn>];
+  extern __shared__ float sMem[];
   auto sIn = make_tensor(make_smem_ptr(sMem), smemLayoutIn);
   auto sOut = make_tensor(make_smem_ptr(sMem), smemLayoutOut);
 
@@ -84,23 +85,35 @@ __global__ void softmax_device(
   auto tIngIn = thrCopyIn.partition_S(gIn);
   auto tInsIn = thrCopyIn.partition_D(sIn);
 
+  const auto pipeNum = size<2>(sIn);
+  for (auto pipeIndex = 0; pipeIndex < pipeNum; ++pipeIndex) {
+    copy(tiledCopyIn, tIngIn(_, _, _, pipeIndex), tInsIn(_, _, _, pipeIndex));
+    cp_async_fence();
+  }
+
+  auto pipeRead = 0;
+
   auto tCsIn = local_partition(sIn, computeLayout, threadIdx.x);
   auto tCsOut = local_partition(sOut, computeLayout, threadIdx.x);
-  auto tCrOut = make_tensor_like(tCsOut);
+  auto tCrOut = make_tensor_like(tCsOut(_, _, 0));
 
   clear(tCrOut);
 
-  auto blockNum = size<2>(gIn);
-  for (auto blockCount = 0; blockCount < blockNum; ++blockCount) {
-    __syncthreads();
-    copy(tiledCopyIn, tIngIn(_, _, _, blockCount), tInsIn(_, _, _));
-    cp_async_fence();
-    cp_async_wait<0>();
-    __syncthreads();
+  const auto blockNum = size<2>(gIn);
+  for (auto blockIndex = 0; blockIndex < blockNum; ++blockIndex) {
+    cp_async_wait<pipeNum - 1>();
 
-    for (auto i = 0; i < size(tCsIn); ++i) {
-      tCrOut[i] += expf(tCsIn[i]);
+    __syncthreads();
+    auto tCsInPipe = tCsIn(_, _, pipeRead);
+    for (auto i = 0; i < size(tCsInPipe); ++i) {
+      tCrOut[i] += expf(tCsInPipe[i]);
     }
+
+    __syncthreads();
+    auto blockIndexOnFlight = blockIndex + pipeNum;
+    copy(tiledCopyIn, tIngIn(_, _, _, blockIndexOnFlight), tInsIn(_, _, _, pipeRead));
+
+    pipeRead = (pipeRead + 1) == pipeNum ? 0 : pipeRead + 1;
   }
 
   auto thrSum = 0.0f;
@@ -130,19 +143,23 @@ __global__ void softmax_device(
   auto tOutgOut = thrCopyOut.partition_D(gOut);
   auto tOutsOut = thrCopyOut.partition_S(sOut);
 
-  for (auto blockCount = 0; blockCount < blockNum; ++blockCount) {
-    __syncthreads();
-    copy(tiledCopyIn, tIngIn(_, _, _, blockCount), tInsIn(_, _, _));
-    cp_async_fence();
-    cp_async_wait<0>();
+  for (auto blockIndex = 0; blockIndex < blockNum; ++blockIndex) {
+    cp_async_wait<pipeNum - 1>();
 
     __syncthreads();
-    for (auto i = 0; i < size(tCsIn); ++i) {
-      tCsIn[i] = expf(tCsIn[i]) / globalSum;
+    auto tCsInPipe = tCsIn(_, _, pipeRead);
+    for (auto i = 0; i < size(tCsInPipe); ++i) {
+      tCsInPipe[i] = expf(tCsInPipe[i]) / globalSum;
     }
 
+    auto tOutsOutPipe = tOutsOut(_, _, _, pipeRead);
+    copy(tiledCopyOut, tOutsOutPipe, tOutgOut(_, _, _, blockIndex));
+
     __syncthreads();
-    copy(tiledCopyOut, tOutsOut(_, _, _), tOutgOut(_, _, _, blockCount));
+    auto blockIndexOnFlight = blockIndex + pipeNum;
+    copy(tiledCopyIn, tIngIn(_, _, _, blockIndexOnFlight), tInsIn(_, _, _, pipeRead));
+
+    pipeRead = (pipeRead + 1) == pipeNum ? 0 : pipeRead + 1;
   }
 }
 
@@ -155,11 +172,12 @@ void softmax(int m, int n, float *dIn, int ldIn, float *dOut, int ldOut) {
   auto strideOut = make_stride(ldOut, Int<1>{});
 
   auto bM = Int<1>{};
-  auto bN = Int<512>{};
+  auto bN = Int<8192>{};
   auto ctaTiler = make_shape(bM, bN);
+  auto bP = Int<4>{};
 
-  auto sIn = make_layout(make_shape(bM, bN));
-  auto sOut = make_layout(make_shape(bM, bN));
+  auto sIn = make_layout(make_shape(bM, bN, bP));
+  auto sOut = make_layout(make_shape(bM, bN, bP));
 
   auto copyIn = make_tiled_copy(
       Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, float>{},
@@ -175,7 +193,7 @@ void softmax(int m, int n, float *dIn, int ldIn, float *dOut, int ldOut) {
   const dim3 dimBlock(size(computeLayout));
   const dim3 dimGrid(size(ceil_div(m, bM)));
 
-  softmax_device<<<dimGrid, dimBlock>>>(
+  softmax_device<<<dimGrid, dimBlock, cosize(sIn) * sizeof(float), 0>>>(
       probShape,
       ctaTiler,
       dIn,
