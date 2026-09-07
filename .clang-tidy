@@ -102,6 +102,12 @@ CheckOptions:
     value: CamelCase
   - key: readability-identifier-naming.TemplateParameterCase
     value: CamelCase
+  # Non-type template parameters are compile-time constants, so they follow the
+  # constexpr rule (kCamelCase) rather than the type rule above.
+  - key: readability-identifier-naming.ValueTemplateParameterCase
+    value: CamelCase
+  - key: readability-identifier-naming.ValueTemplateParameterPrefix
+    value: 'k'
 
   # Enum values: CamelCase
   - key: readability-identifier-naming.EnumConstantCase
