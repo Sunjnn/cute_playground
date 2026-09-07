@@ -189,6 +189,6 @@ void softmax(int m, int n, float *dIn, int ldIn, float *dOut, int ldOut) {
       computeLayout);
   auto error = cudaDeviceSynchronize();
   if (error != cudaSuccess) {
-    throw runtime_error("");
+    throw runtime_error(cudaGetErrorString(error));
   }
 }

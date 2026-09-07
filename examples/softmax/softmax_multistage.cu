@@ -292,6 +292,6 @@ void softmax_multistage(int m, int n, float *dIn, int ldIn, float *dOut, int ldO
       computeLayout);
   auto error = cudaDeviceSynchronize();
   if (error != cudaSuccess) {
-    throw runtime_error("");
+    throw runtime_error(cudaGetErrorString(error));
   }
 }
