@@ -20,6 +20,7 @@
 #include "cudnn_softmax.cuh"
 #include "fmha_softmax.cuh"
 #include "softmax.cuh"
+#include "softmax_multistage.cuh"
 
 using cutlass::CommandLine;
 using std::array;
@@ -54,10 +55,11 @@ struct Impl {
   SoftmaxFn run;
 };
 
-constexpr size_t kImplCount = 4;
+constexpr size_t kImplCount = 5;
 
 constexpr array<Impl, kImplCount> kImpls{
     {Impl{"softmax", softmax},
+     Impl{"softmax_multistage", softmax_multistage},
      Impl{"softmax_cub", softmax_cub},
      Impl{"softmax_fmha", softmax_fmha},
      Impl{"softmax_cudnn", softmax_cudnn}}};
@@ -128,8 +130,9 @@ double benchmark(const Impl &impl, const Problem &prob, float *dIn, float *dOut)
   timer.start();
   for (auto i = 0; i < prob.iterations; ++i) {
     impl.run(prob.m, prob.n, dIn, prob.n, dOut, prob.n);
-    // softmax() synchronizes internally, the other three do not. Synchronizing here keeps them on
-    // the same footing instead of letting the asynchronous paths overlap successive iterations.
+    // softmax() and softmax_multistage() synchronize internally, the others do not.
+    // Synchronizing here keeps them on the same footing instead of letting async paths overlap
+    // successive iterations.
     check(cudaStreamSynchronize(nullptr));
   }
   return static_cast<double>(timer.milliseconds()) * 1000.0 / prob.iterations;
@@ -197,7 +200,7 @@ void print_table(const Problem &prob, const array<Result, kImplCount> &results) 
 
   printf("softmax of %d x %d float, %d timed iterations\n", prob.m, prob.n, prob.iterations);
   printf(
-      "%-16s %-8s %13s %10s %8s %10s\n",
+      "%-20s %-8s %13s %10s %8s %10s\n",
       "implementation",
       "verify",
       "max_rel_diff",
@@ -213,7 +216,7 @@ void print_table(const Problem &prob, const array<Result, kImplCount> &results) 
       verifyText = result.verified ? "PASS" : "FAIL";
     }
     printf(
-        "%-16s %-8s %13s %10s %8s %10s\n",
+        "%-20s %-8s %13s %10s %8s %10s\n",
         kImpls[i].name,
         verifyText,
         number(result.checked, "%.3e", result.maxRelDiff).c_str(),
