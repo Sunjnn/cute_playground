@@ -68,6 +68,7 @@ endif()
 
 include(Cutlass)
 include(Cudnn)
+include(Cutensor)
 
 option(BUILD_EXAMPLES "Build CuTe learning examples" ON)
 
