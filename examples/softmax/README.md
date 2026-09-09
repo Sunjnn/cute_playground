@@ -98,9 +98,10 @@ hits (470–493).
 566–572 GB/s is a real ~378–381 GB/s of DRAM traffic — ~85% of peak — with
 nothing left to miss: there is no second read, so no L2 reuse window, so no
 dependence on footprint or row length. It matches cuDNN at every non-paged
-shape (1.15–1.49× over `softmax`), and degrades only mildly at 16384×32768
-(461.5 priced ≈ 308 real), where the 4 GB footprint and 128 KB rows start
-to cost the streaming path a little.
+shape (1.15–1.49× over `softmax`). The low 461.5 at 16384×32768 in the
+table is a noise sample, not a shape property — re-running that shape in
+later sessions measured anywhere from 399 to 573 GB/s, including 570.7
+(see Run-to-run variance).
 
 **Why `softmax_multistage`'s win is conditional.** Its second read of each
 row is served from L2 only while the reuse window fits 24 MB. The sweep
@@ -125,20 +126,35 @@ card's ~7 GiB usable VRAM, so WDDM pages to system RAM and every kernel —
 including cuDNN — runs at PCIe speed (~55 GB/s). Keep
 M × N × 4 × 2 ≲ 6 GiB to stay off this cliff.
 
-**Run-to-run variance.** The latency-sensitive kernels (`multistage`,
-`fmha`, `cub`) can vary a lot between sessions — in this sweep `cub` and
-`fmha` at 32768×16384 record 326 and 320 GB/s where the previous sweep
-recorded 397 and 384, and `multistage` at 16384×32768 swung from 393 to
-365. The robust ones (`softmax`, `softmax_regcache`, and cuDNN in this
-sweep) reproduce within a few percent. Treat this matrix as one coherent
-session.
+**Run-to-run variance.** At the large shapes the numbers are session
+noise, and the ranking by exposure is the ranking by latency tolerance.
+This is a shared desktop GPU: ~20 desktop processes (DWM, browser, IM
+clients, …) are resident and insert intermittent memory-system bursts
+between the benchmark's kernels, and GDDR7 steps through power states
+(405 ↔ 7001 ↔ 13801 MHz) on a seconds scale as those bursts come and go.
+Re-running 16384×32768 across sessions measured `softmax_regcache` from
+399 to 573 GB/s and `softmax_cudnn` from 433 to 572 — no shape decides
+these numbers. `softmax` (12 CTAs/SM, 100% occupancy) hides the spikes
+and reproduces within 2% every time; cuDNN is usually immune but gets hit
+in degraded windows; `softmax_regcache` (1×1024-thread CTA per SM at
+128 KB rows — a single 32-warp barrier with no second CTA to overlap),
+`softmax_multistage`, `cub` and `fmha` are the first to feel it.
+Diagnostics confirm it is environmental rather than a kernel defect:
+profiling the same launches with Nsight Compute always shows a healthy
+87%-DRAM-bound kernel, because ncu's per-launch instrumentation paces the
+launches and lets the clock ramp — the badness lives in native
+back-to-back pacing. The 461.5 at 16384×32768 in the table above was such
+a sample, and so are the collapsed `cub`/`fmha` entries at 32768×16384.
+Treat the whole matrix as one coherent session.
 
 ## Takeaways
 
 - `softmax_regcache`'s single-read design is the fix for the biggest gap the
   earlier sweep identified: it matches cuDNN at every non-paged shape
-  (~1.45× over the two-pass baseline) by cutting traffic from 3× to 2×,
-  and unlike pipelining it holds at 4 GB footprints and 128 KB rows.
+  (~1.45× over the two-pass baseline) by cutting traffic from 3× to 2×.
+  It has no re-reads to lose, so it never collapses the way
+  `softmax_multistage` does at 4 GB — but at those footprints its own
+  numbers scatter with session noise (see Run-to-run variance).
 - `softmax_multistage`'s pipeline is a real 1.16–1.46× win — but only while
   its re-reads stay in L2 (≤ 2 GB footprints with rows ≤ 64 KB on this
   card). At 4 GB it is at or below the single-buffer baseline.
