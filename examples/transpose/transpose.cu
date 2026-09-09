@@ -20,7 +20,6 @@
 #include "cute/tensor.hpp" // IWYU pragma: keep
 #include "cute/tensor_impl.hpp"
 #include "cute/underscore.hpp"
-#include "cutlass/uint128.h"
 
 using cute::_;
 using cute::ceil_div;
@@ -30,7 +29,6 @@ using cute::cosize_v;
 using cute::cp_async_fence;
 using cute::cp_async_wait;
 using cute::Int;
-using cute::local_partition;
 using cute::local_tile;
 using cute::make_coord;
 using cute::make_gmem_ptr;
@@ -43,7 +41,6 @@ using cute::make_tiled_copy;
 using cute::size;
 using cute::SM80_CP_ASYNC_CACHEALWAYS;
 using cute::Swizzle;
-using cute::uint128_t;
 using cute::uint32_t;
 using cute::UniversalCopy;
 using std::runtime_error;
@@ -55,11 +52,9 @@ template <
     class CtaTiler,
     class StrideIn,
     class StrideOut,
-    class SmemLayoutIn,
-    class SmemLayoutOut,
+    class SmemLayout,
     class TiledCopyIn,
-    class TiledCopyOut,
-    class ComputeLayout>
+    class TiledCopyOut>
 __global__ void transpose_device(
     ProblemShape probShape,
     CtaTiler ctaTiler,
@@ -67,11 +62,9 @@ __global__ void transpose_device(
     StrideIn strideIn,
     float *dOut,
     StrideOut strideOut,
-    SmemLayoutIn smemLayoutIn,
-    SmemLayoutOut smemlayoutOut,
+    SmemLayout smemLayout,
     TiledCopyIn tiledCopyIn,
-    TiledCopyOut tiledCopyOut,
-    ComputeLayout computeLayout) {
+    TiledCopyOut tiledCopyOut) {
   const auto mIn = make_tensor(make_gmem_ptr(dIn), probShape, strideIn);
   auto mOut = make_tensor(make_gmem_ptr(dOut), probShape, strideOut);
 
@@ -79,37 +72,23 @@ __global__ void transpose_device(
   const auto gIn = local_tile(mIn, ctaTiler, ctaCoord);
   auto gOut = local_tile(mOut, ctaTiler, ctaCoord);
 
-  // cosize_v is a namespace-scope constexpr variable, so nvcc only accepts it in
-  // device code where it folds into a constant expression - fine for the array
-  // bound below, but not for the pointer arithmetic that offsets sOut. Naming it
-  // once sidesteps that and keeps the offset and the bound from drifting apart.
-  constexpr int kSmemIn = cosize_v<SmemLayoutIn>;
-  __shared__ float sMem[kSmemIn + cosize_v<SmemLayoutOut>];
-  const auto sIn = make_tensor(make_smem_ptr(sMem), smemLayoutIn);
-  auto sOut = make_tensor(make_smem_ptr(sMem) + kSmemIn, smemlayoutOut);
+  __shared__ float sMem[cosize_v<SmemLayout>];
+  const auto sTile = make_tensor(make_smem_ptr(sMem), smemLayout);
 
   const auto thrCopyIn = tiledCopyIn.get_slice(threadIdx.x);
   const auto tIngIn = thrCopyIn.partition_S(gIn);
-  auto tInsIn = thrCopyIn.partition_D(sIn);
+  auto tInsTile = thrCopyIn.partition_D(sTile);
 
-  copy(tiledCopyIn, tIngIn(_, _, _), tInsIn(_, _, _));
+  copy(tiledCopyIn, tIngIn(_, _, _), tInsTile(_, _, _));
   cp_async_fence();
-
-  auto tCsIn = local_partition(sIn, computeLayout, threadIdx.x);
-  auto tCsOut = local_partition(sOut, computeLayout, threadIdx.x);
 
   cp_async_wait<0>();
   __syncthreads();
-  for (auto i = 0; i < size(tCsIn); ++i) {
-    tCsOut[i] = tCsIn[i];
-  }
-
-  __syncthreads();
   const auto thrCopyOut = tiledCopyOut.get_slice(threadIdx.x);
-  const auto tOutsOut = thrCopyOut.partition_S(sOut);
+  const auto tOutsTile = thrCopyOut.partition_S(sTile);
   auto tOutgOut = thrCopyOut.partition_D(gOut);
 
-  copy(tiledCopyOut, tOutsOut, tOutgOut);
+  copy(tiledCopyOut, tOutsTile, tOutgOut);
   cp_async_fence();
   cp_async_wait<0>();
 }
@@ -124,8 +103,8 @@ void transpose(int m, int n, const float *dIn, int ldIn, float *dOut, int ldOut)
 
   // Both tensors span the same (m, n) index space and the transpose lives entirely in the strides:
   // element (i, j) is at i * ldIn + j in dIn and at j * ldOut + i in dOut. Nothing downstream has
-  // to permute a coordinate - the two shared-memory buffers below hold the same logical tile and
-  // differ only in how it is physically addressed.
+  // to permute a coordinate - the shared-memory tile below is a pure pass-through, written and read
+  // at the same logical (i, j).
   auto strideIn = make_stride(ldIn, Int<1>{});
   auto strideOut = make_stride(Int<1>{}, ldOut);
 
@@ -133,43 +112,48 @@ void transpose(int m, int n, const float *dIn, int ldIn, float *dOut, int ldOut)
   auto bN = Int<32>{};
   auto ctaTiler = make_shape(bM, bN);
 
-  // sIn is dense and deliberately not swizzled. copyIn fills it with a 128-bit cp.async, and copy()
-  // recasts its destination to uint128_t, which upcasts the swizzle by 4. A swizzle that permutes
-  // floats inside a 16-byte chunk cannot survive that: upcast clamps MBase to 0 and silently drops
-  // the low bits rather than failing, so the vectorized write and the scalar read below would
-  // disagree about where an element lives. sIn needs no swizzle anyway - the relayout reads it
-  // along rows, which is already conflict-free.
-  auto smemLayoutIn = make_layout(make_shape(bM, bN), make_stride(bN, Int<1>{}));
-
-  // sOut is where the bank conflicts get solved. Swizzle<5, 0, 5> xors the whole 5-bit column index
-  // with the row index, which de-conflicts both directions through the buffer: the relayout writes
-  // one row per warp, copyOut reads one column, and either way the 32 accesses land on 32 distinct
-  // banks. A dense sOut would make that column read a 32-way conflict. MBase is 0, so the
-  // permutation reaches inside a 16-byte chunk - legal only because copyOut is a 32-bit atom and
-  // never recasts. The period is 2^(0 + 5 + 5) = 1024 floats, exactly one tile, so the atom already
-  // is the whole layout and there is nothing for tile_to_shape to repeat. Both smem layouts stay
-  // static, which is what lets the kernel size its shared memory with cosize_v.
-  auto swizzleAtom = composition(
-      Swizzle<5, 0, 5>{},
-      make_layout(make_shape(Int<32>{}, Int<32>{}), make_stride(Int<32>{}, Int<1>{})));
-  auto smemLayoutOut = swizzleAtom;
+  // One buffer, one layout. copyIn writes logical (i, j) and copyOut reads logical (i, j) - the
+  // transpose itself lives entirely in the global strides - so the two only round-trip through
+  // shared memory if they agree on where (i, j) physically sits. Two layouts over the same array (a
+  // dense one to load into, a swizzled one to store out of) need an explicit relayout pass between
+  // them to move the data from one arrangement to the other; without it every row but the zeroth
+  // reads back permuted.
+  //
+  // Swizzle<5, 0, 5> xors the whole 5-bit column index with the row index, which de-conflicts both
+  // directions through the buffer: copyIn writes along a row and copyOut reads down a column, and
+  // either way the 32 accesses land on 32 distinct banks. A dense buffer would make that column
+  // read a 32-way conflict. The period is 2^(0 + 5 + 5) = 1024 floats, exactly one tile, so the
+  // swizzle atom already is the whole layout. It stays static, which is what lets the kernel size
+  // its shared memory with cosize_v.
+  //
+  // MBase 0 is what forces copyIn down to a 4-byte atom. The permutation reaches inside a 16-byte
+  // chunk, and copy() recasts a wide atom's destination to uint128_t; upcast<4> then subtracts
+  // log2(4) from MBase, goes negative, and silently truncates Swizzle<5, 0, 5> to Swizzle<3, 0, 5>
+  // rather than failing. Two bits dropped means the vectorized write no longer lands where the
+  // scalar read looks. A 4-byte atom never recasts, so the two stay in agreement.
+  auto smemLayout =
+      composition(Swizzle<5, 0, 5>{}, make_layout(make_shape(bM, bN), make_stride(bN, Int<1>{})));
 
   // Both copies use all 128 threads, and each one's thread layout is picked to be coalesced in the
   // global tensor it touches: copyIn indexes threads along n, where dIn is contiguous, and copyOut
   // along m, where dOut is.
   //
-  // copyIn vectorizes, because a thread's four floats along n are contiguous in dIn and in sIn: one
-  // 16-byte cp.async per thread, issued twice to cover the 32 rows.
+  // copyIn cannot vectorize. A thread's four floats along n are contiguous in dIn, but MBase 0 lets
+  // the swizzle permute them within their 16-byte chunk of the tile, so there is no single wide
+  // store that expresses where they land. It issues one 4-byte cp.async per float instead - eight
+  // per thread to cover the tile, against two for a 16-byte atom. That costs instructions, not
+  // coalescing: the four floats a thread owns are the four that fill the same 128-byte line of dIn,
+  // so each line is still written once, in four instructions.
   //
-  // copyOut cannot. A thread's four floats along m are contiguous in dOut, but sOut's swizzle
-  // scatters them, and no layout of sOut could be contiguous along both m and n anyway. So it stays
-  // 32-bit and takes its coalescing from the thread layout instead: 32 threads run down m with
-  // stride 1, so one instruction is exactly one 128-byte segment of dOut, repeated eight times to
-  // cover the 32 columns. Vectorizing it would mean going through registers - read sOut 32 bits at
-  // a time, write the registers back out as a float4 - for the same bytes at a quarter of the
-  // instructions.
+  // copyOut could not vectorize either way. A thread's four floats along m are contiguous in dOut,
+  // but the swizzle scatters them, and no layout of the tile could be contiguous along both m and n
+  // anyway. So it stays 32-bit and takes its coalescing from the thread layout instead: 32 threads
+  // run down m with stride 1, so one instruction is exactly one 128-byte segment of dOut, repeated
+  // eight times to cover the 32 columns. Vectorizing it would mean going through registers - read
+  // the tile 32 bits at a time, write the registers back out as a float4 - for the same bytes at a
+  // quarter of the instructions.
   auto copyIn = make_tiled_copy(
-      Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, float>{},
+      Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint32_t>, float>{},
       make_layout(make_shape(Int<16>{}, Int<8>{}), make_stride(Int<8>{}, Int<1>{})),
       make_layout(make_shape(Int<1>{}, Int<4>{})));
   auto copyOut = make_tiled_copy(
@@ -177,27 +161,11 @@ void transpose(int m, int n, const float *dIn, int ldIn, float *dOut, int ldOut)
       make_layout(make_shape(Int<32>{}, Int<4>{}), make_stride(Int<1>{}, Int<32>{})),
       make_layout(make_shape(Int<1>{}, Int<1>{})));
 
-  // The relayout between the two buffers, one warp per row of the tile. It has to be static:
-  // local_partition on the swizzled sOut goes through to_mixed_bits, which static_asserts a
-  // power-of-two shape * stride, so a dynamic extent here does not compile at all.
-  auto computeLayout =
-      make_layout(make_shape(Int<4>{}, Int<32>{}), make_stride(Int<32>{}, Int<1>{}));
-
   const dim3 dimBlock(size(copyIn));
   const dim3 dimGrid(size(ceil_div(m, bM)), size(ceil_div(n, bN)));
 
   transpose_device<<<dimGrid, dimBlock>>>(
-      probShape,
-      ctaTiler,
-      dIn,
-      strideIn,
-      dOut,
-      strideOut,
-      smemLayoutIn,
-      smemLayoutOut,
-      copyIn,
-      copyOut,
-      computeLayout);
+      probShape, ctaTiler, dIn, strideIn, dOut, strideOut, smemLayout, copyIn, copyOut);
   auto error = cudaGetLastError();
   if (error != cudaSuccess) {
     throw runtime_error(cudaGetErrorString(error));
