@@ -21,6 +21,7 @@
 #include "fmha_softmax.cuh"
 #include "softmax.cuh"
 #include "softmax_multistage.cuh"
+#include "softmax_regcache.cuh"
 
 using cutlass::CommandLine;
 using std::array;
@@ -55,11 +56,12 @@ struct Impl {
   SoftmaxFn run;
 };
 
-constexpr size_t kImplCount = 5;
+constexpr size_t kImplCount = 6;
 
 constexpr array<Impl, kImplCount> kImpls{
     {Impl{"softmax", softmax},
      Impl{"softmax_multistage", softmax_multistage},
+     Impl{"softmax_regcache", softmax_regcache},
      Impl{"softmax_cub", softmax_cub},
      Impl{"softmax_fmha", softmax_fmha},
      Impl{"softmax_cudnn", softmax_cudnn}}};
@@ -130,8 +132,8 @@ double benchmark(const Impl &impl, const Problem &prob, float *dIn, float *dOut)
   timer.start();
   for (auto i = 0; i < prob.iterations; ++i) {
     impl.run(prob.m, prob.n, dIn, prob.n, dOut, prob.n);
-    // softmax() and softmax_multistage() synchronize internally, the others do not.
-    // Synchronizing here keeps them on the same footing instead of letting async paths overlap
+    // softmax(), softmax_multistage() and softmax_regcache() synchronize internally, the others do
+    // not. Synchronizing here keeps them on the same footing instead of letting async paths overlap
     // successive iterations.
     check(cudaStreamSynchronize(nullptr));
   }
@@ -192,8 +194,9 @@ string number(bool valid, const char *format, double value) {
 
 void print_table(const Problem &prob, const array<Result, kImplCount> &results) {
   // The GB/s column prices every implementation at two reads of the input and one write of the
-  // output, which is what the three kernels in this repository do and the least a two-pass softmax
-  // can cost.
+  // output, which is what the two-pass kernels do and the least a two-pass softmax can cost.
+  // softmax_regcache reads the input once, so it really moves 2/3 of the traffic it is priced for:
+  // read its GB/s against a ceiling 1.5x higher than the two-pass kernels'.
   auto trafficBytes = 3.0 * static_cast<double>(prob.m) * static_cast<double>(prob.n) *
                       static_cast<double>(sizeof(float));
   auto softmaxUs = results[0].timed ? results[0].usPerIter : 0.0;
