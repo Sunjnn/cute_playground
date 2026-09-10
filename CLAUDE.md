@@ -47,6 +47,18 @@ contributes no build targets and configure still succeeds.
   exposes the result as the `playground::cudnn` INTERFACE target. When nothing
   is found the target defines `PLAYGROUND_NO_CUDNN` instead, `softmax_cudnn()`
   becomes a stub that says so, and the build does not depend on cuDNN.
+- **cuTENSOR** — optional, and only the `transpose_cutensor` baseline in
+  `examples/transpose` uses it. Unlike cuBLAS and cuDNN it does not ship with
+  the CUDA toolkit. `cmake/Cutensor.cmake` searches the default paths plus
+  `-DCUTENSOR_ROOT=...` (an unpacked `.deb`, a pip wheel such as
+  `cutensor-cu13`, a vendor drop) and exposes the result as the
+  `playground::cutensor` INTERFACE target. When nothing is found the target
+  defines `PLAYGROUND_NO_CUTENSOR` instead and `transpose_cutensor()` becomes a
+  stub that says so.
+- **cuBLAS** — ships with the CUDA toolkit, so it is not optional: it is linked
+  into every example as `CUDA::cublas` (from the `find_package(CUDAToolkit)`
+  call in `cmake/Cutlass.cmake`), and only the `transpose_cublas` baseline uses
+  it.
 
 ## Lint & Format
 

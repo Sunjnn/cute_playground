@@ -28,12 +28,25 @@ list(REMOVE_DUPLICATES example_dirs)
 
 foreach(dir ${example_dirs})
   add_executable(${dir} ${example_srcs_${dir}})
-  # playground::cudnn is linked everywhere, not just where cuDNN is used, to keep this loop
-  # uniform. It is an INTERFACE target that either supplies cuDNN's include path and library or
-  # defines PLAYGROUND_NO_CUDNN, so it costs nothing when the dependency is absent.
-  target_link_libraries(${dir} PRIVATE cutlass::cute playground::cudnn)
+  # playground::cudnn and playground::cutensor are linked everywhere, not just where they are used,
+  # to keep this loop uniform. Each is an INTERFACE target that either supplies its library's
+  # include path and library or defines PLAYGROUND_NO_<LIB>, so it costs nothing when the
+  # dependency is absent. CUDA::cublas is unconditional: cmake/Cutlass.cmake runs
+  # find_package(CUDAToolkit REQUIRED) whenever a CUDA compiler was found, and without one this
+  # directory returns early above.
+  target_link_libraries(
+    ${dir} PRIVATE cutlass::cute playground::cudnn playground::cutensor CUDA::cublas)
   target_include_directories(${dir} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/${dir})
   target_compile_options(
     ${dir} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr
                     --expt-extended-lambda>)
 endforeach()
+
+# cuTENSOR 2.7's host-side plan creation overflows the linker's default 1 MiB main-thread stack on
+# sm_120 and dies with STATUS_STACK_BUFFER_OVERRUN inside cutensorCreatePlan (verified on an RTX
+# 5060, CUDA 13.3). Only transpose calls cuTENSOR, so only it gets the larger stack; 8 MiB held for
+# every shape in the README sweep up to 16384 x 16384.
+target_link_options(
+  transpose
+  PRIVATE $<$<LINK_LANG_AND_ID:CUDA,NVIDIA>:-Xlinker;/STACK:8388608>)
+
