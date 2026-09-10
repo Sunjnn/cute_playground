@@ -41,3 +41,12 @@ foreach(dir ${example_dirs})
     ${dir} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr
                     --expt-extended-lambda>)
 endforeach()
+
+# cuTENSOR 2.7's host-side plan creation overflows the linker's default 1 MiB main-thread stack on
+# sm_120 and dies with STATUS_STACK_BUFFER_OVERRUN inside cutensorCreatePlan (verified on an RTX
+# 5060, CUDA 13.3). Only transpose calls cuTENSOR, so only it gets the larger stack; 8 MiB held for
+# every shape in the README sweep up to 16384 x 16384.
+target_link_options(
+  transpose
+  PRIVATE $<$<LINK_LANG_AND_ID:CUDA,NVIDIA>:-Xlinker;/STACK:8388608>)
+
