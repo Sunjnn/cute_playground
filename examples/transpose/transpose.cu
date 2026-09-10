@@ -10,10 +10,12 @@
 // other side and pulls both in the working order.
 #include "cute/arch/copy.hpp"
 #include "cute/arch/copy_sm80.hpp"
+#include "cute/config.hpp"
 #include "cute/int_tuple.hpp"
 #include "cute/layout.hpp"
 #include "cute/layout_composed.hpp"
 #include "cute/numeric/integral_constant.hpp"
+#include "cute/numeric/math.hpp"
 #include "cute/pointer.hpp"
 #include "cute/swizzle.hpp"
 #include "cute/swizzle_layout.hpp"
@@ -28,6 +30,7 @@ using cute::Copy_Atom;
 using cute::cosize_v;
 using cute::cp_async_fence;
 using cute::cp_async_wait;
+using cute::get;
 using cute::Int;
 using cute::local_tile;
 using cute::make_coord;
@@ -47,9 +50,59 @@ using std::runtime_error;
 
 namespace {
 
+// Maps a linear CTA id onto a (tile m, tile n) coordinate, so that the CTAs resident at any
+// moment cover a compact square of both tensors rather than one long strip of each.
+//
+// With a plain (tilesM, tilesN) grid and blockIdx.x fastest over m, the ~360 CTAs in flight read
+// 128-byte fragments strided 128 * ldIn apart across the whole of dIn while writing one tight
+// strip of dOut. Against a GDDR7 row buffer of roughly 1 KB every one of those reads is a page
+// miss. Grouping the tiles into supertiles and walking n fastest inside a group turns each row of
+// a supertile into a run of groupN * 128 contiguous bytes of dIn, and walking supertiles along n
+// next extends that run, so both tensors see runs of at least a page. Neither side can be made
+// fully contiguous - that is what makes this a transpose - but neither has to be scattered at
+// 128-byte granularity either.
+//
+// Group sizes are clamped to the tile count on each axis, so a matrix narrower than Group tiles
+// does not pad the grid with empty CTAs. Where a tile count is not a multiple of its group size
+// the grid is rounded up to whole supertiles and the CTAs past the edge exit immediately. That
+// exit is block-uniform, since coord() reads only blockIdx.x, so no CTA can return out of a
+// __syncthreads the rest of it is waiting at.
+template <int Group> struct CtaSwizzle {
+  int tilesM;
+  int tilesN;
+  int groupM;
+  int groupN;
+  int groupsM;
+  int groupsN;
+
+  CUTE_HOST_DEVICE CtaSwizzle(int tilesM, int tilesN)
+  : tilesM(tilesM)
+  , tilesN(tilesN)
+  , groupM(cute::min(Group, tilesM))
+  , groupN(cute::min(Group, tilesN))
+  , groupsM(ceil_div(tilesM, groupM))
+  , groupsN(ceil_div(tilesN, groupN)) {}
+
+  CUTE_HOST_DEVICE int size() const { return groupsM * groupsN * groupM * groupN; }
+
+  // Axis order, fastest first: tile n, tile m, supertile n, supertile m.
+  CUTE_HOST_DEVICE auto coord(int id) const {
+    const auto perGroup = groupM * groupN;
+    const auto within = id % perGroup;
+    const auto group = id / perGroup;
+    return make_coord(
+        within / groupN + (group / groupsN) * groupM, within % groupN + (group % groupsN) * groupN);
+  }
+
+  CUTE_HOST_DEVICE bool contains(int tileM, int tileN) const {
+    return tileM < tilesM && tileN < tilesN;
+  }
+};
+
 template <
     class ProblemShape,
     class CtaTiler,
+    class CtaMap,
     class StrideIn,
     class StrideOut,
     class SmemLayout,
@@ -58,6 +111,7 @@ template <
 __global__ void transpose_device(
     ProblemShape probShape,
     CtaTiler ctaTiler,
+    CtaMap ctaMap,
     const float *dIn,
     StrideIn strideIn,
     float *dOut,
@@ -68,7 +122,10 @@ __global__ void transpose_device(
   const auto mIn = make_tensor(make_gmem_ptr(dIn), probShape, strideIn);
   auto mOut = make_tensor(make_gmem_ptr(dOut), probShape, strideOut);
 
-  const auto ctaCoord = make_coord(blockIdx.x, blockIdx.y);
+  const auto ctaCoord = ctaMap.coord(blockIdx.x);
+  if (!ctaMap.contains(get<0>(ctaCoord), get<1>(ctaCoord))) {
+    return;
+  }
   const auto gIn = local_tile(mIn, ctaTiler, ctaCoord);
   auto gOut = local_tile(mOut, ctaTiler, ctaCoord);
 
@@ -88,9 +145,9 @@ __global__ void transpose_device(
   const auto tOutsTile = thrCopyOut.partition_S(sTile);
   auto tOutgOut = thrCopyOut.partition_D(gOut);
 
+  // The stores below are plain st.global, not cp.async, so there is no group to fence and nothing
+  // for a wait to release - kernel exit is what the host's synchronize waits on.
   copy(tiledCopyOut, tOutsTile, tOutgOut);
-  cp_async_fence();
-  cp_async_wait<0>();
 }
 
 } // namespace
@@ -174,11 +231,15 @@ void transpose(int m, int n, const float *dIn, int ldIn, float *dOut, int ldOut)
       make_layout(make_shape(Int<32>{}, Int<4>{}), make_stride(Int<1>{}, Int<32>{})),
       make_layout(make_shape(Int<1>{}, Int<1>{})));
 
+  // Supertiles of 8 x 8 CTAs: eight tiles along n is 8 * 32 * 4 = 1 KB of dIn per row, about one
+  // GDDR7 page, which is the granularity the read side was missing at 128 bytes.
+  const auto ctaMap = CtaSwizzle<8>{size(ceil_div(m, bM)), size(ceil_div(n, bN))};
+
   const dim3 dimBlock(size(copyIn));
-  const dim3 dimGrid(size(ceil_div(m, bM)), size(ceil_div(n, bN)));
+  const dim3 dimGrid(ctaMap.size());
 
   transpose_device<<<dimGrid, dimBlock>>>(
-      probShape, ctaTiler, dIn, strideIn, dOut, strideOut, smemLayout, copyIn, copyOut);
+      probShape, ctaTiler, ctaMap, dIn, strideIn, dOut, strideOut, smemLayout, copyIn, copyOut);
   auto error = cudaGetLastError();
   if (error != cudaSuccess) {
     throw runtime_error(cudaGetErrorString(error));
