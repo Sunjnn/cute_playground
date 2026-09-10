@@ -138,12 +138,25 @@ void transpose(int m, int n, const float *dIn, int ldIn, float *dOut, int ldOut)
   // global tensor it touches: copyIn indexes threads along n, where dIn is contiguous, and copyOut
   // along m, where dOut is.
   //
-  // copyIn cannot vectorize. A thread's four floats along n are contiguous in dIn, but MBase 0 lets
+  // copyIn cannot vectorize. Widening its value layout to four contiguous floats along n would put
+  // four adjacent floats of dIn in one thread, and those are contiguous in dIn - but MBase 0 lets
   // the swizzle permute them within their 16-byte chunk of the tile, so there is no single wide
   // store that expresses where they land. It issues one 4-byte cp.async per float instead - eight
-  // per thread to cover the tile, against two for a 16-byte atom. That costs instructions, not
-  // coalescing: the four floats a thread owns are the four that fill the same 128-byte line of dIn,
-  // so each line is still written once, in four instructions.
+  // per thread to cover the tile, against two for a 16-byte atom.
+  //
+  // What the thread layout buys in place of that is one warp-instruction per 128-byte line of dIn.
+  // All 32 lanes run along n with stride 1, so lane k and lane k + 1 read adjacent floats and the
+  // longest run of consecutive floats in an instruction is the full 32. The layout only spans 4 of
+  // the tile's 32 rows, so the repeat count along m is 8 and a thread's eight instructions step
+  // down in strides of 4. The narrower shapes each lose somewhere: with 8 lanes along n every
+  // instruction spans 4 rows and 4 lines however the values are grouped, and handing one thread the
+  // four floats on top of that also isolates each lane - longest run 1, and 16 sectors touched per
+  // instruction against 4.
+  //
+  // The same layout is what keeps the shared-memory write conflict-free. Under Swizzle<5, 0, 5> the
+  // write bank is n ^ m, and with n spanning all 32 lanes that xor reaches all 32 banks. Restrict n
+  // to 8 and a warp carries m over 0..3 against n over 0..7, so n ^ m collapses onto 8 banks and
+  // the write becomes a 4-way conflict.
   //
   // copyOut could not vectorize either way. A thread's four floats along m are contiguous in dOut,
   // but the swizzle scatters them, and no layout of the tile could be contiguous along both m and n
@@ -154,8 +167,8 @@ void transpose(int m, int n, const float *dIn, int ldIn, float *dOut, int ldOut)
   // quarter of the instructions.
   auto copyIn = make_tiled_copy(
       Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint32_t>, float>{},
-      make_layout(make_shape(Int<16>{}, Int<8>{}), make_stride(Int<8>{}, Int<1>{})),
-      make_layout(make_shape(Int<1>{}, Int<4>{})));
+      make_layout(make_shape(Int<4>{}, Int<32>{}), make_stride(Int<32>{}, Int<1>{})),
+      make_layout(make_shape(Int<1>{}, Int<1>{})));
   auto copyOut = make_tiled_copy(
       Copy_Atom<UniversalCopy<uint32_t>, float>{},
       make_layout(make_shape(Int<32>{}, Int<4>{}), make_stride(Int<1>{}, Int<32>{})),
