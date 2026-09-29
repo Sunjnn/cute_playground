@@ -127,15 +127,21 @@ rmsnorm_fused        PASS         ...          ...      ...      ...
 
 ## Caveats
 
-- **`rmsnorm_cutensor` has never been compiled.** libcutensor is not installed
-  where this repo is developed (`cmake/Cutensor.cmake` reports NOTFOUND, so
+- **`rmsnorm_cutensor` has never been compiled.** The container this folder was
+  built in has no libcutensor (`cmake/Cutensor.cmake` reports NOTFOUND, so
   `PLAYGROUND_NO_CUTENSOR` is defined and only the stub is built), and the
   cuTENSOR 2.x signatures were reconstructed from `cutensorCreatePermutation` in
   `examples/transpose` — the one operation in that API this repo has exercised.
-  `cutensorCreateReduction` and the three `*Execute` argument lists in
-  particular need checking against `cutensor.h` before that row is trusted with
-  a number. Install cuTENSOR and reconfigure with `-DCUTENSOR_ROOT=<dir>` to
-  find out.
+  `cutensorCreateReduction` and the three `*Execute` argument lists in particular
+  need checking against `cutensor.h`. The RTX 5060 host does have cuTENSOR 2.7
+  (`-DCUTENSOR_ROOT="C:/Program Files/NVIDIA cuTENSOR/v2.7"`, per
+  `examples/transpose/README.md`), so that is where this branch gets its first
+  compile — expect to fix signatures there.
+- **`rmsnorm_cutensor` builds five plans per call,** and cuTENSOR 2.7's host-side
+  plan creation overflows the linker's default 1 MiB main-thread stack on sm_120
+  (`STATUS_STACK_BUFFER_OVERRUN` inside `cutensorCreatePlan`). `examples/CMakeLists.txt`
+  therefore gives the `rmsnorm` target the same `/STACK:8388608` it gives
+  `transpose`, which only builds one plan.
 - **`rmsnorm_cudnn` compiles but has not run.** Two things could still reject at
   runtime: `cudnnOpTensor`'s broadcast of a size-1 `C` dimension, and SPATIAL
   batch norm with `C = m = 8192` channels of width 1. If either fails the row
