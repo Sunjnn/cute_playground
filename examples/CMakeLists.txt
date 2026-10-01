@@ -44,9 +44,18 @@ endforeach()
 
 # cuTENSOR 2.7's host-side plan creation overflows the linker's default 1 MiB main-thread stack on
 # sm_120 and dies with STATUS_STACK_BUFFER_OVERRUN inside cutensorCreatePlan (verified on an RTX
-# 5060, CUDA 13.3). Only transpose calls cuTENSOR, so only it gets the larger stack; 8 MiB held for
-# every shape in the README sweep up to 16384 x 16384.
-target_link_options(
-  transpose
-  PRIVATE $<$<LINK_LANG_AND_ID:CUDA,NVIDIA>:-Xlinker;/STACK:8388608>)
+# 5060, CUDA 13.3). transpose builds one plan per call and rmsnorm_cutensor builds five, so both
+# need the larger stack; only these two call cuTENSOR. 8 MiB held for every shape in the transpose
+# README sweep up to 16384 x 16384.
+#
+# /STACK is link.exe's, hence the MSVC guard: the flag is passed straight to the host linker, and
+# ld.bfd rejects it as a missing input file. Elsewhere the main-thread stack comes from ulimit -s,
+# which is 8 MiB by default anyway.
+if(MSVC)
+  foreach(cutensor_user transpose rmsnorm)
+    target_link_options(
+      ${cutensor_user}
+      PRIVATE $<$<LINK_LANG_AND_ID:CUDA,NVIDIA>:-Xlinker;/STACK:8388608>)
+  endforeach()
+endif()
 

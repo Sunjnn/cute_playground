@@ -44,6 +44,7 @@ cmake/Cudnn.cmake       # wires up the optional playground::cudnn INTERFACE targ
 cmake/Cutensor.cmake    # wires up the optional playground::cutensor INTERFACE target
 examples/               # one executable per .cpp / .cu file
 examples/softmax/       # softmax shootout, see examples/softmax/README.md
+examples/rmsnorm/       # RMSNorm shootout, see examples/rmsnorm/README.md
 third_party/cutlass/    # CUTLASS git submodule (headers only)
 scripts/                # format.sh (clang-format), tidy.sh (clang-tidy)
 ```
