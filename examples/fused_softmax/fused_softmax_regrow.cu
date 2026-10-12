@@ -11,10 +11,7 @@
 
 using cute::_;
 using cute::_1;
-using cute::clear;
-using cute::copy;
 using cute::Copy_Atom;
-using cute::gemm;
 using cute::half_t;
 using cute::Int;
 using cute::Layout;
@@ -39,6 +36,7 @@ using cute::Tile;
 using cute::uint128_t;
 using cute::UniversalCopy;
 using cute::X;
+using fused_softmax::compute_tile;
 using fused_softmax::kBlockK;
 using fused_softmax::kBlockM;
 using fused_softmax::kMmaAtomsM;
@@ -175,14 +173,14 @@ __global__ __launch_bounds__(kThreads) void fused_softmax_regrow_device(
   // n is exactly kBlockN for this build, so the N tile index is always the static zero and one CTA
   // spans the whole row.
   const auto ctaCoord = make_coord(blockIdx.x, Int<0>{}, _);
-  Tensor gA = local_tile(mA, ctaTiler, ctaCoord, Step<_1, X, _1>{}); // (BLK_M,BLK_K,k)
-  Tensor gB = local_tile(mB, ctaTiler, ctaCoord, Step<X, _1, _1>{}); // (BLK_N,BLK_K,k)
+  const Tensor gA = local_tile(mA, ctaTiler, ctaCoord, Step<_1, X, _1>{});
+  const Tensor gB = local_tile(mB, ctaTiler, ctaCoord, Step<X, _1, _1>{});
 
   auto *sAPtr = reinterpret_cast<half_t *>(sRaw);
   auto *sBPtr = sAPtr + static_cast<int64_t>(kBlockM) * kBlockK;
-  Tensor sA =
+  const Tensor sA =
       make_tensor(make_smem_ptr(sAPtr), make_layout(make_shape(bM, bK), make_stride(bK, Int<1>{})));
-  Tensor sB =
+  const Tensor sB =
       make_tensor(make_smem_ptr(sBPtr), make_layout(make_shape(bN, bK), make_stride(bK, Int<1>{})));
 
   // One 128-bit atom is 8 halves, and the thread layout puts K fastest so a warp's eight lanes
@@ -191,14 +189,6 @@ __global__ __launch_bounds__(kThreads) void fused_softmax_regrow_device(
       Copy_Atom<UniversalCopy<uint128_t>, half_t>{},
       Layout<Shape<Int<32>, Int<8>>, Stride<Int<8>, Int<1>>>{},
       Layout<Shape<Int<1>, Int<8>>>{});
-  // get_slice is static on TiledCopy but not on TiledMMA, so the two calls below look different.
-  // transpose.cu gets away with the instance form because its TiledCopy is a template parameter and
-  // clang-tidy cannot see through a dependent type.
-  const auto thrCopy = decltype(tiledCopy)::get_slice(threadIdx.x);
-  Tensor tAgA = thrCopy.partition_S(gA); // (CPY,CPY_M,CPY_K,k)
-  Tensor tAsA = thrCopy.partition_D(sA); // (CPY,CPY_M,CPY_K)
-  Tensor tBgB = thrCopy.partition_S(gB); // (CPY,CPY_N,CPY_K,k)
-  Tensor tBsB = thrCopy.partition_D(sB); // (CPY,CPY_N,CPY_K)
 
   auto tiledMma = make_tiled_mma(
       SM80_16x8x16_F32F16F16F32_TN{},
@@ -207,39 +197,20 @@ __global__ __launch_bounds__(kThreads) void fused_softmax_regrow_device(
   const auto thrMma = tiledMma.get_slice(threadIdx.x);
 
   // Aliases sA and sB. Declared here because the accumulator's shape is derived from it, but not
-  // written to until the barrier after the K loop retires both operand tiles.
+  // written to until the barrier at the end of compute_tile() retires both operand tiles.
   auto *scoresPtr = reinterpret_cast<float *>(sRaw);
   Tensor sScores = make_tensor(
       make_smem_ptr(scoresPtr), make_layout(make_shape(bM, bN), make_stride(bN, Int<1>{})));
 
+  // Only the accumulator side of the MMA is partitioned here; compute_tile() does the operand side
+  // itself, from the same sA and sB.
   Tensor tCsScores = thrMma.partition_C(sScores);     // (MMA,MMA_M,MMA_N)
-  Tensor tCrA = thrMma.partition_fragment_A(sA);      // (MMA,MMA_M,MMA_K)
-  Tensor tCrB = thrMma.partition_fragment_B(sB);      // (MMA,MMA_N,MMA_K)
   Tensor tCrC = thrMma.partition_fragment_C(sScores); // (MMA,MMA_M,MMA_N)
   const Tensor tCcC = thrMma.partition_C(make_identity_tensor(make_shape(bM, bN)));
-  Tensor tCsA = thrMma.partition_A(sA);               // (MMA,MMA_M,MMA_K)
-  Tensor tCsB = thrMma.partition_B(sB);               // (MMA,MMA_N,MMA_K)
 
-  clear(tCrC);
-
-  const int kTiles = size<3>(tAgA);
-  for (auto kt = 0; kt < kTiles; ++kt) {
-    // Synchronous on purpose: this is the version that is easy to see is correct. The cp.async ring
-    // replaces these two copies and the barriers around them.
-    copy(tiledCopy, tAgA(_, _, _, kt), tAsA);
-    copy(tiledCopy, tBgB(_, _, _, kt), tBsB);
-    __syncthreads();
-
-    CUTE_UNROLL
-    for (auto kb = 0; kb < size<2>(tCrA); ++kb) {
-      // Elementwise rather than through an SM75_U32x4_LDSM_N atom: ldmatrix needs a swizzled smem
-      // layout to be worth anything, and this build has none.
-      copy(tCsA(_, _, kb), tCrA(_, _, kb));
-      copy(tCsB(_, _, kb), tCrB(_, _, kb));
-      gemm(tiledMma, tCrA(_, _, kb), tCrB(_, _, kb), tCrC);
-    }
-    __syncthreads();
-  }
+  // gB takes no column slice here, which is the whole difference from fused_softmax_recompute: n is
+  // exactly kBlockN, so the one tile this computes is the entire row.
+  compute_tile(tiledCopy, tiledMma, gA, sA, gB, sB, tCrC, size<2>(gA));
 
   // Cast once here rather than at each use: blockIdx.x is unsigned, and leaving it that way would
   // narrow to int at the call sites below.

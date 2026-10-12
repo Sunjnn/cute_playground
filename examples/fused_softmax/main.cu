@@ -18,6 +18,7 @@
 
 #include "cublas_unfused_softmax.cuh"
 #include "fused_softmax_naive.cuh"
+#include "fused_softmax_recompute.cuh"
 #include "fused_softmax_regrow.cuh"
 #include "reference.cuh"
 
@@ -61,12 +62,13 @@ struct Impl {
   FusedSoftmaxFn run;
 };
 
-constexpr size_t kImplCount = 3;
+constexpr size_t kImplCount = 4;
 
 constexpr array<Impl, kImplCount> kImpls{
     {Impl{"fused_softmax_naive", fused_softmax_naive},
      Impl{"cublas_unfused_softmax", cublas_unfused_softmax},
-     Impl{"fused_softmax_regrow", fused_softmax_regrow}}};
+     Impl{"fused_softmax_regrow", fused_softmax_regrow},
+     Impl{"fused_softmax_recompute", fused_softmax_recompute}}};
 
 // The speedup column is priced against the unfused cuBLAS baseline rather than against kImpls[0]:
 // fused_softmax_naive is a correctness floor, deliberately without tensor cores or any reuse, so
