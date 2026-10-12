@@ -42,9 +42,14 @@ struct Handle {
 
 // Same register budget as softmax_regcache, whose structure this walks: 8 x float4 = 32 floats per
 // thread, which at 1024 threads caps a row at 32768 columns.
+//
+// kMinThreads is 64 here where softmax_regcache uses 128, which puts the row floor at 256 columns
+// rather than 512. That is not a tuning choice: fused_softmax_regrow holds a whole row on chip and
+// so only runs at n = 256, and a baseline that cannot run at the shapes the kernel under test can
+// is not a baseline. Below 64 threads a 256-column row would leave some threads with no float4.
 constexpr int kVecPerThread = 8;
 
-constexpr int kMinThreads = 128;
+constexpr int kMinThreads = 64;
 constexpr int kMaxThreads = 1024;
 
 // Below kMinN some threads would hold no element at all; above kMaxN the row stops fitting.
@@ -218,7 +223,7 @@ void cublas_unfused_softmax(
     throw runtime_error("cublas_unfused_softmax needs n to be a multiple of 4 and ldP even");
   }
   if (n < kMinN || n > kMaxN) {
-    throw runtime_error("cublas_unfused_softmax holds one row in registers, so 512 <= n <= 32768");
+    throw runtime_error("cublas_unfused_softmax holds one row in registers, so 256 <= n <= 32768");
   }
 
   // cudaMallocAsync and the harness's UINT64_MAX release threshold, as in rmsnorm_cublas: the
@@ -263,7 +268,13 @@ void cublas_unfused_softmax(
 
   const dim3 dimBlock(threads);
   const dim3 dimGrid(m);
+  // One case per value the doubling loop above can produce, and the default is the loop's last one
+  // rather than a catch-all: instantiating a wider kernel for a narrower dimBlock would leave most
+  // of the template's stride loop unexecuted and silently compute the wrong row.
   switch (threads) {
+  case 64:
+    mask_softmax_device<64><<<dimGrid, dimBlock>>>(dScores, dP, ldP, m, n, causal);
+    break;
   case 128:
     mask_softmax_device<128><<<dimGrid, dimBlock>>>(dScores, dP, ldP, m, n, causal);
     break;
