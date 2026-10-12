@@ -14,14 +14,27 @@ fi
 # frontend, which rejects nvcc-only flags (-arch=native, --expt-*, -x cu, ...).
 # Build a sanitized copy with those stripped and `-x cu` -> `-x cuda`; this
 # mirrors the Remove list in .clangd so both tools see the same flags.
+#
+# The arch rules also swallow an optional \" pair. Two things have to line up for
+# that to be needed:
+#   - CMake quotes a flag whose value contains brackets, and --generate-code's
+#     does once an architecture is given explicitly. The
+#     -DCMAKE_CUDA_ARCHITECTURES=120 that CLAUDE.md recommends whenever detection
+#     is unavailable emits "--generate-code=arch=compute_120,code=[compute_120,sm_120]"
+#     where a detected -arch=native stays bare.
+#   - This sed runs over the JSON text, not over a parsed argv, so those quotes
+#     reach it escaped as \" and the pattern has to spell the backslash too.
+# Miss either and the flag survives the sed and clang aborts the TU with "unknown
+# argument". .clangd needs no such fix: its Remove list globs arguments that have
+# already been split and unquoted.
 db_dir="$(mktemp -d)"
 trap 'rm -rf "$db_dir"' EXIT
 sed -E \
     -e 's/ -forward-unknown-to-host-compiler//g' \
     -e 's/ --expt-relaxed-constexpr//g' \
     -e 's/ --expt-extended-lambda//g' \
-    -e 's/ --generate-code=[^" ]*//g' \
-    -e 's/ -arch=[^" ]*//g' \
+    -e 's/ (\\")?--generate-code=[^\\"]*(\\")?//g' \
+    -e 's/ (\\")?-arch=[^\\"]*(\\")?//g' \
     -e 's/ -Xcompiler=[^" ]*//g' \
     -e 's/ -x cu / -x cuda /g' \
     build/compile_commands.json >"$db_dir/compile_commands.json"
