@@ -7,13 +7,14 @@
 
 #include "cute/tensor.hpp" // IWYU pragma: keep
 
+#include "fused_softmax_mainloop.cuh"
+
 using cute::_;
 using cute::_1;
 using cute::clear;
 using cute::copy;
 using cute::Copy_Atom;
 using cute::gemm;
-using cute::get;
 using cute::half_t;
 using cute::Int;
 using cute::Layout;
@@ -38,6 +39,16 @@ using cute::Tile;
 using cute::uint128_t;
 using cute::UniversalCopy;
 using cute::X;
+using fused_softmax::kBlockK;
+using fused_softmax::kBlockM;
+using fused_softmax::kMmaAtomsM;
+using fused_softmax::kMmaAtomsN;
+using fused_softmax::kMmaK;
+using fused_softmax::kMmaM;
+using fused_softmax::kMmaN;
+using fused_softmax::kThreads;
+using fused_softmax::kWarps;
+using fused_softmax::store_scores;
 using std::int64_t;
 using std::runtime_error;
 
@@ -47,21 +58,11 @@ namespace {
 // MMA accumulator and the softmax is a reduction over registers rather than over global memory.
 // That is the entire trick: P is written once and S is never written at all, so this kernel moves
 // 2*M*N bytes against cublas_unfused_softmax's 10*M*N. The price is that the row has to fit, which
-// is what caps n here.
-constexpr int kBlockM = 32;
+// is what caps n at kBlockN here; fused_softmax_recompute streams the columns instead.
+//
+// kBlockM, kBlockK, kThreads and the MMA shape come from fused_softmax_mainloop.cuh, which is where
+// the two fused kernels have to agree.
 constexpr int kBlockN = 256;
-constexpr int kBlockK = 64;
-
-constexpr int kThreads = 256;
-constexpr int kWarps = kThreads / 32;
-
-// The MMA is 2 x 4 atoms of 16x8x16, so it covers 32 x 32 x 16 per instruction group and needs
-// exactly 2 * 4 * 32 = 256 threads - the same kThreads the copies are partitioned over.
-constexpr int kMmaAtomsM = 2;
-constexpr int kMmaAtomsN = 4;
-constexpr int kMmaM = kMmaAtomsM * 16;
-constexpr int kMmaN = kMmaAtomsN * 8;
-constexpr int kMmaK = 16;
 
 // Shared memory: the GEMM tiles want (kBlockM + kBlockN) * kBlockK * 2 = 36 KB and the score
 // staging wants kBlockM * kBlockN * 4 = 32 KB, but the two phases never overlap, so one buffer
@@ -85,34 +86,6 @@ static_assert(kSmemBytes <= 48 * 1024, "bump cudaFuncSetAttribute before growing
 // cost of 512 is shared memory - 68 KB, past the opt-in threshold - and half as many CTAs. So
 // kBlockN = 256 is where the sweep starts, not where it has to stop.
 constexpr int kColsPerLane = kBlockN / 32;
-
-// Scale, mask, and hand the accumulator to shared memory in one pass. The identity tensor is what
-// turns a flat fragment index into the (row, column) it belongs to, which is the only way to ask
-// whether the causal mask bites at that particular element.
-template <class TCrC, class TCcC, class TCsScores>
-__device__ void store_scores(
-    const TCrC &tCrC,
-    const TCcC &tCcC,
-    TCsScores &tCsScores,
-    int rowBase,
-    int m,
-    int n,
-    float scale,
-    bool causal) {
-  CUTE_UNROLL
-  for (auto i = 0; i < size(tCrC); ++i) {
-    const auto row = rowBase + static_cast<int>(get<0>(tCcC(i)));
-    const auto col = static_cast<int>(get<1>(tCcC(i)));
-    auto value = tCrC(i) * scale;
-    // Column j is visible iff j <= row + n - m, which keeps the last query aligned with the last
-    // key when m < n. main.cu rejects m > n, so every row keeps at least column 0 and the row sum
-    // below is never a division by zero.
-    if (causal && col > row + n - m) {
-      value = -INFINITY;
-    }
-    tCsScores(i) = value;
-  }
-}
 
 // One warp per row, kWarps rows at a time. Every column of a row lives in the one warp that owns
 // it, so both reductions are pure shuffles and need no shared-memory scratch - unlike
@@ -272,7 +245,8 @@ __global__ __launch_bounds__(kThreads) void fused_softmax_regrow_device(
   // narrow to int at the call sites below.
   const auto rowBase = static_cast<int>(blockIdx.x) * kBlockM;
 
-  store_scores(tCrC, tCcC, tCsScores, rowBase, m, n, scale, causal);
+  // colBase is zero because n is exactly kBlockN: one CTA tile is the whole row.
+  store_scores(tCrC, tCcC, tCsScores, rowBase, 0, m, n, scale, causal);
   __syncthreads();
 
   softmax_rows(scoresPtr, dP, ldP, rowBase);
