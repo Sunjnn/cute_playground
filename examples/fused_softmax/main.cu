@@ -16,6 +16,7 @@
 #include "cutlass/util/command_line.h"
 #include "cutlass/util/GPU_Clock.hpp"
 
+#include "cublas_unfused_softmax.cuh"
 #include "fused_softmax_naive.cuh"
 #include "reference.cuh"
 
@@ -59,9 +60,16 @@ struct Impl {
   FusedSoftmaxFn run;
 };
 
-constexpr size_t kImplCount = 1;
+constexpr size_t kImplCount = 2;
 
-constexpr array<Impl, kImplCount> kImpls{{Impl{"fused_softmax_naive", fused_softmax_naive}}};
+constexpr array<Impl, kImplCount> kImpls{
+    {Impl{"fused_softmax_naive", fused_softmax_naive},
+     Impl{"cublas_unfused_softmax", cublas_unfused_softmax}}};
+
+// The speedup column is priced against the unfused cuBLAS baseline rather than against kImpls[0]:
+// fused_softmax_naive is a correctness floor, deliberately without tensor cores or any reuse, so
+// beating it says nothing. cublas_unfused_softmax is what this looks like when you do not fuse.
+constexpr size_t kBaselineIndex = 1;
 
 struct Result {
   bool checked = false;
@@ -191,11 +199,12 @@ void print_table(const Problem &prob, const array<Result, kImplCount> &results) 
   //
   // GB/s prices every implementation at 2*M*N bytes - the write of P and nothing else. That is the
   // irreducible traffic of this problem, so the column reads as "how close to the output floor":
-  // a kernel that materializes S in global memory and walks it again moves several times what it is
-  // priced for, and shows up here as a fraction of the card's 448 GB/s even when its DRAM is
-  // saturated. The fused kernels also read Q and K, which at these shapes is ~12% on top.
+  // cublas_unfused_softmax moves 5x what it is priced for (4*M*N of fp32 scores written, the same
+  // read back, 2*M*N of P), and shows up here as a fraction of the card's 448 GB/s even when its
+  // DRAM is saturated. The fused kernels also read Q and K, which at these shapes is ~12% on top.
   const auto flops = 2.0 * static_cast<double>(prob.m) * prob.n * prob.k;
   const auto trafficBytes = 2.0 * static_cast<double>(prob.m) * prob.n * sizeof(__half);
+  const auto baselineUs = results[kBaselineIndex].timed ? results[kBaselineIndex].usPerIter : 0.0;
 
   printf(
       "fused softmax of (%d x %d) by (%d x %d)^T, %s mask, scale %.6f, %d timed iterations\n",
@@ -207,29 +216,32 @@ void print_table(const Problem &prob, const array<Result, kImplCount> &results) 
       prob.scale,
       prob.iterations);
   printf(
-      "%-24s %-8s %13s %10s %9s %8s\n",
+      "%-24s %-8s %13s %10s %9s %8s %10s\n",
       "implementation",
       "verify",
       "max_rel_diff",
       "time_us",
       "TFLOP/s",
-      "GB/s");
+      "GB/s",
+      "vs_cublas");
   for (auto i = size_t{0}; i < kImplCount; ++i) {
     const auto &result = results[i];
     const auto tflops = flops / (result.usPerIter * 1e-6) / 1e12;
     const auto gbps = trafficBytes / (result.usPerIter * 1e-6) / 1e9;
+    const auto speedup = baselineUs / result.usPerIter;
     const char *verifyText = "-";
     if (result.checked) {
       verifyText = result.verified ? "PASS" : "FAIL";
     }
     printf(
-        "%-24s %-8s %13s %10s %9s %8s\n",
+        "%-24s %-8s %13s %10s %9s %8s %10s\n",
         kImpls[i].name,
         verifyText,
         number(result.checked, "%.3e", result.maxRelDiff).c_str(),
         number(result.timed, "%.1f", result.usPerIter).c_str(),
         number(result.timed, "%.1f", tflops).c_str(),
-        number(result.timed, "%.1f", gbps).c_str());
+        number(result.timed, "%.1f", gbps).c_str(),
+        number(result.timed && baselineUs > 0.0, "%.2fx", speedup).c_str());
     if (!result.error.empty()) {
       printf("    %s\n", result.error.c_str());
     }
@@ -283,6 +295,15 @@ int main(int argc, char const **argv) {
   }
 
   try {
+    // cublas_unfused_softmax allocates its m x n score buffer with cudaMallocAsync on every call.
+    // cudaFreeAsync hands pages back to the driver once the pool's release threshold (0 by default)
+    // is exceeded, which would put a real allocation inside the timed region and measure the
+    // allocator rather than the kernels.
+    cudaMemPool_t pool = nullptr;
+    check(cudaDeviceGetDefaultMemPool(&pool, 0));
+    auto threshold = uint64_t{UINT64_MAX};
+    check(cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &threshold));
+
     auto engine = mt19937(20261012);
     auto hQ = make_input(static_cast<size_t>(prob.m) * prob.k, engine);
     auto hK = make_input(static_cast<size_t>(prob.n) * prob.k, engine);
