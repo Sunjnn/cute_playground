@@ -51,6 +51,20 @@ CUTE_HOST_DEVICE constexpr auto make_k_major_smem_layout(BShape const &bM, KShap
       cute::make_shape(bM, bK));
 }
 
+// The same tile with a pipeline stage appended: (bM, bK, kStages), where stage s starts at
+// cosize(bM, bK) * s. That is the layout the cp.async ring in compute_tile_async() writes into.
+template <int kStages, class BShape, class KShape>
+CUTE_HOST_DEVICE constexpr auto make_k_major_smem_layout(BShape const &bM, KShape const &bK) {
+  static_assert(kStages >= 1, "a ring needs at least one stage");
+  return cute::tile_to_shape(
+      cute::composition(
+          cute::Swizzle<3, 3, 3>{},
+          cute::Layout<
+              cute::Shape<cute::_8, cute::Shape<cute::_8, cute::_8>>,
+              cute::Stride<cute::_8, cute::Stride<cute::_1, cute::_64>>>{}),
+      cute::make_shape(bM, bK, cute::Int<kStages>{}));
+}
+
 // Scale, mask, and write the accumulator to shared memory in one pass. The identity tensor behind
 // tCcC is what turns a flat fragment index into the (row, column) it belongs to, which is the only
 // way to ask whether the causal mask bites at that particular element; rowBase and colBase place
@@ -282,6 +296,95 @@ __device__ void compute_tile(
       cute::gemm(tiledMma, tCrA(_, _, kb), tCrB(_, _, kb), tCrC);
     }
     __syncthreads();
+  }
+}
+
+// The cp.async form of compute_tile(): the same tile, staged through a ring of kStages shared
+// buffers, so the global-to-shared copy of tile kt + kStages can overlap the ldmatrix and MMA of
+// tile kt. kStages = 1 is the degenerate ring: it still uses cp.async, but only issues the next
+// tile's copy after the current one has been consumed. That is what fused_softmax_recompute uses
+// today - a two-stage ring costs a CTA of residency at both column widths, which measured worse
+// than the overlap was worth - but the ring is kept because the answer depends on the tile.
+//
+// Each tile is its own cp.async commit group, so the wait before tile kt retires exactly that tile:
+// with a full ring, leaving kStages - 1 groups in flight proves the oldest one has landed. The last
+// tile has no successor to leave in flight, so it waits for all of them.
+template <
+    int kStages,
+    class TTiledCopy,
+    class TTiledMma,
+    class TGmemA,
+    class TSmemA,
+    class TGmemB,
+    class TSmemB,
+    class TAcc>
+__device__ void compute_tile_async(
+    const TTiledCopy &tiledCopy,
+    const TTiledMma &tiledMma,
+    const TGmemA &gA,
+    const TSmemA &sA,
+    const TGmemB &gB,
+    const TSmemB &sB,
+    TAcc &tCrC,
+    int kTiles) {
+  using cute::_;
+  static_assert(kStages >= 1, "a ring needs at least one stage");
+
+  const auto thrCopy = TTiledCopy::get_slice(threadIdx.x);
+  auto tAgA = thrCopy.partition_S(gA); // (CPY,CPY_M,CPY_K,k)
+  auto tAsA = thrCopy.partition_D(sA); // (CPY,CPY_M,CPY_K,PIPE)
+  auto tBgB = thrCopy.partition_S(gB); // (CPY,CPY_N,CPY_K,k)
+  auto tBsB = thrCopy.partition_D(sB); // (CPY,CPY_N,CPY_K,PIPE)
+
+  const auto thrMma = tiledMma.get_slice(threadIdx.x);
+  // The fragment is per-stage, so it is partitioned from a single stage's slice; the pipelined
+  // operand tensors below keep the PIPE mode.
+  auto tCrA = thrMma.partition_fragment_A(sA(_, _, cute::Int<0>{})); // (MMA,MMA_M,MMA_K)
+  auto tCrB = thrMma.partition_fragment_B(sB(_, _, cute::Int<0>{})); // (MMA,MMA_N,MMA_K)
+
+  // Same ldmatrix atoms as compute_tile(); see the comment there for why A is x4 and B is x2.
+  const auto s2rAtomA = cute::Copy_Atom<cute::SM75_U32x4_LDSM_N, cute::half_t>{};
+  const auto s2rAtomB = cute::Copy_Atom<cute::SM75_U32x2_LDSM_N, cute::half_t>{};
+  const auto s2rCopyA = cute::make_tiled_copy_A(s2rAtomA, tiledMma);
+  const auto s2rCopyB = cute::make_tiled_copy_B(s2rAtomB, tiledMma);
+  const auto thrS2rA = s2rCopyA.get_slice(threadIdx.x);
+  const auto thrS2rB = s2rCopyB.get_slice(threadIdx.x);
+  auto tXsA = thrS2rA.partition_S(sA); // (CPY,MMA_M,MMA_K,PIPE)
+  auto tXsB = thrS2rB.partition_S(sB); // (CPY,MMA_N,MMA_K,PIPE)
+  auto tXrA = thrS2rA.retile_D(tCrA);  // (CPY,MMA_M,MMA_K)
+  auto tXrB = thrS2rB.retile_D(tCrB);  // (CPY,MMA_N,MMA_K)
+
+  // Fill the ring. Every tile commits its own group so the waits can retire them one at a time.
+  const auto prefetch = kTiles < kStages ? kTiles : kStages;
+  for (auto s = 0; s < prefetch; ++s) {
+    cute::copy(tiledCopy, tAgA(_, _, _, s), tAsA(_, _, _, s));
+    cute::copy(tiledCopy, tBgB(_, _, _, s), tBsB(_, _, _, s));
+    cute::cp_async_fence();
+  }
+
+  cute::clear(tCrC);
+  for (auto kt = 0; kt < kTiles; ++kt) {
+    const auto stage = kt % kStages;
+    if (kt + 1 < kTiles) {
+      cute::cp_async_wait<kStages - 1>();
+    } else {
+      cute::cp_async_wait<0>();
+    }
+    __syncthreads();
+
+    CUTE_UNROLL
+    for (auto kb = 0; kb < cute::size<2>(tCrA); ++kb) {
+      cute::copy(s2rAtomA, tXsA(_, _, kb, stage), tXrA(_, _, kb));
+      cute::copy(s2rAtomB, tXsB(_, _, kb, stage), tXrB(_, _, kb));
+      cute::gemm(tiledMma, tCrA(_, _, kb), tCrB(_, _, kb), tCrC);
+    }
+    __syncthreads();
+
+    if (kt + kStages < kTiles) {
+      cute::copy(tiledCopy, tAgA(_, _, _, kt + kStages), tAsA(_, _, _, stage));
+      cute::copy(tiledCopy, tBgB(_, _, _, kt + kStages), tBsB(_, _, _, stage));
+      cute::cp_async_fence();
+    }
   }
 }
 

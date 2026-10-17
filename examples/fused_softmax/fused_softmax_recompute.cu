@@ -34,9 +34,8 @@ using cute::Stride;
 using cute::Tensor;
 using cute::Tile;
 using cute::uint128_t;
-using cute::UniversalCopy;
 using cute::X;
-using fused_softmax::compute_tile;
+using fused_softmax::compute_tile_async;
 using fused_softmax::kBlockK;
 using fused_softmax::kBlockM;
 using fused_softmax::kMmaAtomsM;
@@ -88,18 +87,28 @@ template <int kBlockN> constexpr int scores_smem_bytes() {
 
 // The three buffers are live at the same time here, unlike in fused_softmax_regrow where the score
 // staging can alias the operand tiles: the next tile's operands are being loaded while the current
-// tile's scores are still being reduced. 36 KB at 128, 20 KB at 64.
-template <int kBlockN> constexpr int smem_bytes() {
-  return operand_smem_bytes<kBlockN>() + scores_smem_bytes<kBlockN>();
+// tile's scores are still being reduced. The operand buffers are staged kStages deep, so the ring
+// is kStages * operand + scores: 20 KB for (64, 1) - four CTAs per SM - and 36 KB for (128, 1).
+//
+// kStages is 1 for both instantiations today. A two-stage ring was measured and lost a CTA of
+// residency at each width (64: 4 -> 3, 128: 2 -> 1), which cost more at the large shapes than the
+// overlap bought; the parameter stays so the trade can be retried when the tile changes. What did
+// pay is the cp.async copy itself, with one commit group per tile and a wait before the read: it
+// removed the synchronous load/store chain and is worth 9-16% on the 128-wide shapes with fewer
+// CTAs (1024 x 2048, 1024 x 8192, and the causal squares).
+template <int kBlockN, int kStages> constexpr int smem_bytes() {
+  return kStages * operand_smem_bytes<kBlockN>() + scores_smem_bytes<kBlockN>();
 }
 
-static_assert(smem_bytes<64>() <= 48 * 1024, "bump cudaFuncSetAttribute before growing the tile");
-static_assert(smem_bytes<128>() <= 48 * 1024, "bump cudaFuncSetAttribute before growing the tile");
+static_assert(
+    smem_bytes<64, 1>() <= 48 * 1024, "bump cudaFuncSetAttribute before growing the tile");
+static_assert(
+    smem_bytes<128, 1>() <= 48 * 1024, "bump cudaFuncSetAttribute before growing the tile");
 
 // The scores land in shared memory row-major so the reductions can walk a row contiguously. The
 // GEMM tiles are K-major for the same reason on their side: the copy atom moves 8 contiguous
 // halves, and both operands are K-contiguous in global memory.
-template <int kBlockN>
+template <int kBlockN, int kStages>
 __global__ __launch_bounds__(kThreads) void fused_softmax_recompute_device(
     const __half *__restrict__ dQ,
     int ldQ,
@@ -146,17 +155,20 @@ __global__ __launch_bounds__(kThreads) void fused_softmax_recompute_device(
   const Tensor gB = local_tile(mB, ctaTiler, ctaCoord, Step<X, _1, _1>{});
 
   auto *sAPtr = reinterpret_cast<half_t *>(sRaw);
-  auto *sBPtr = sAPtr + static_cast<int64_t>(kBlockM) * kBlockK;
-  auto *scoresPtr = reinterpret_cast<float *>(sBPtr + static_cast<int64_t>(kBlockN) * kBlockK);
-  const Tensor sA = make_tensor(make_smem_ptr(sAPtr), make_k_major_smem_layout(bM, bK));
-  const Tensor sB = make_tensor(make_smem_ptr(sBPtr), make_k_major_smem_layout(bN, bK));
+  auto *sBPtr = sAPtr + static_cast<int64_t>(kBlockM) * kBlockK * kStages;
+  auto *scoresPtr =
+      reinterpret_cast<float *>(sBPtr + static_cast<int64_t>(kBlockN) * kBlockK * kStages);
+  const Tensor sA = make_tensor(make_smem_ptr(sAPtr), make_k_major_smem_layout<kStages>(bM, bK));
+  const Tensor sB = make_tensor(make_smem_ptr(sBPtr), make_k_major_smem_layout<kStages>(bN, bK));
   Tensor sScores = make_tensor(
       make_smem_ptr(scoresPtr), make_layout(make_shape(bM, bN), make_stride(bN, Int<1>{})));
 
   // One 128-bit atom is 8 halves, and the thread layout puts K fastest so a warp's eight lanes
   // cover 128 contiguous bytes of one row rather than eight separate rows.
+  // cp.async, not UniversalCopy: this copy is what the ring in compute_tile_async() overlaps with
+  // the ldmatrix and MMA of the previous tile.
   auto tiledCopy = make_tiled_copy(
-      Copy_Atom<UniversalCopy<uint128_t>, half_t>{},
+      Copy_Atom<cute::SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, half_t>{},
       Layout<Shape<Int<32>, Int<8>>, Stride<Int<8>, Int<1>>>{},
       Layout<Shape<Int<1>, Int<8>>>{});
   auto tiledMma = make_tiled_mma(
@@ -165,8 +177,8 @@ __global__ __launch_bounds__(kThreads) void fused_softmax_recompute_device(
       Tile<Int<kMmaM>, Int<kMmaN>, Int<kMmaK>>{});
   const auto thrMma = tiledMma.get_slice(threadIdx.x);
 
-  // Only the accumulator side of the MMA is partitioned here; compute_tile() does the operand side
-  // itself, from the same sA and sB.
+  // Only the accumulator side of the MMA is partitioned here; compute_tile_async() does the operand
+  // side itself, from the same sA and sB.
   Tensor tCsScores = thrMma.partition_C(sScores);     // (MMA,MMA_M,MMA_N)
   Tensor tCrC = thrMma.partition_fragment_C(sScores); // (MMA,MMA_M,MMA_N)
   const Tensor tCcC = thrMma.partition_C(make_identity_tensor(make_shape(bM, bN)));
@@ -195,7 +207,7 @@ __global__ __launch_bounds__(kThreads) void fused_softmax_recompute_device(
 
   // Pass 1: statistics. Every active tile is computed, folded into (max, sum), and dropped.
   for (auto nt = 0; nt < activeTiles; ++nt) {
-    compute_tile(tiledCopy, tiledMma, gA, sA, gB(_, _, nt, _), sB, tCrC, kTiles);
+    compute_tile_async<kStages>(tiledCopy, tiledMma, gA, sA, gB(_, _, nt, _), sB, tCrC, kTiles);
     store_scores(tCrC, tCcC, tCsScores, rowBase, nt * kBlockN, m, n, scale, causal);
     __syncthreads();
     online_row_stats<kBlockN / 32>(scoresPtr, sRowMax, sRowSum);
@@ -206,7 +218,7 @@ __global__ __launch_bounds__(kThreads) void fused_softmax_recompute_device(
   // come back as -INFINITY from store_scores and leave as exactly 0, so this pass needs no mask
   // logic of its own.
   for (auto nt = 0; nt < activeTiles; ++nt) {
-    compute_tile(tiledCopy, tiledMma, gA, sA, gB(_, _, nt, _), sB, tCrC, kTiles);
+    compute_tile_async<kStages>(tiledCopy, tiledMma, gA, sA, gB(_, _, nt, _), sB, tCrC, kTiles);
     store_scores(tCrC, tCcC, tCsScores, rowBase, nt * kBlockN, m, n, scale, causal);
     __syncthreads();
     normalize_rows<kBlockN / 32>(scoresPtr, dP, ldP, rowBase, nt * kBlockN, sRowMax, sRowSum);
@@ -219,7 +231,7 @@ __global__ __launch_bounds__(kThreads) void fused_softmax_recompute_device(
   }
 }
 
-template <int kBlockN>
+template <int kBlockN, int kStages>
 void launch_recompute(
     int m,
     int n,
@@ -234,8 +246,9 @@ void launch_recompute(
     bool causal) {
   const dim3 dimBlock(kThreads);
   const dim3 dimGrid(m / kBlockM);
-  fused_softmax_recompute_device<kBlockN><<<dimGrid, dimBlock, smem_bytes<kBlockN>()>>>(
-      dQ, ldQ, dK, ldK, dP, ldP, m, n, k, scale, causal);
+  fused_softmax_recompute_device<kBlockN, kStages>
+      <<<dimGrid, dimBlock, smem_bytes<kBlockN, kStages>()>>>(
+          dQ, ldQ, dK, ldK, dP, ldP, m, n, k, scale, causal);
 }
 
 } // namespace
@@ -277,7 +290,7 @@ void fused_softmax_recompute(
   static const auto sWave128 = [] {
     auto blocks = 2; // the shape this kernel was tuned around, if the query fails
     if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &blocks, fused_softmax_recompute_device<128>, kThreads, smem_bytes<128>()) !=
+            &blocks, fused_softmax_recompute_device<128, 1>, kThreads, smem_bytes<128, 1>()) !=
         cudaSuccess) {
       blocks = 2;
     }
@@ -296,9 +309,9 @@ void fused_softmax_recompute(
   // the imbalance, and a causal CTA's work is not the full row anyway.
   const auto useNarrow = n % 128 != 0 || (!causal && rowBlocks > sWave128);
   if (useNarrow) {
-    launch_recompute<64>(m, n, k, dQ, ldQ, dK, ldK, dP, ldP, scale, causal);
+    launch_recompute<64, 1>(m, n, k, dQ, ldQ, dK, ldK, dP, ldP, scale, causal);
   } else {
-    launch_recompute<128>(m, n, k, dQ, ldQ, dK, ldK, dP, ldP, scale, causal);
+    launch_recompute<128, 1>(m, n, k, dQ, ldQ, dK, ldK, dP, ldP, scale, causal);
   }
   auto error = cudaDeviceSynchronize();
   if (error != cudaSuccess) {
