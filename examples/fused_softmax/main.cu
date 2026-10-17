@@ -49,7 +49,9 @@ constexpr int kWarmupIterations = 3;
 // P is stored as fp16, whose relative resolution is 2^-11 = 4.9e-4, so the output cannot be held to
 // the 1e-4 examples/softmax uses - that example stores fp32. 1e-3 leaves room for one rounding of P
 // plus the noise in an fp32 accumulation whose order differs from the reference's, without being so
-// loose that a wrong row reduction could slip through.
+// loose that a wrong row reduction could slip through. Below fp16's smallest normal, max_rel_diff()
+// measures against 2^-14 rather than against the reference, because the format itself has moved to
+// a fixed subnormal spacing there.
 constexpr double kMaxRelDiff = 1e-3;
 
 constexpr char kDefaultMask[] = "causal";
@@ -207,7 +209,7 @@ void print_table(const Problem &prob, const array<Result, kImplCount> &results) 
   // read back, 2*M*N of P), and shows up here as a fraction of the card's 448 GB/s even when its
   // DRAM is saturated. The fused kernels also read Q and K, which at these shapes is ~12% on top.
   const auto flops = 2.0 * static_cast<double>(prob.m) * prob.n * prob.k;
-  const auto trafficBytes = 2.0 * static_cast<double>(prob.m) * prob.n * sizeof(__half);
+  const auto trafficBytes = static_cast<double>(prob.m) * prob.n * sizeof(__half);
   const auto baselineUs = results[kBaselineIndex].timed ? results[kBaselineIndex].usPerIter : 0.0;
 
   printf(

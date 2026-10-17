@@ -45,9 +45,11 @@ using fused_softmax::kMmaK;
 using fused_softmax::kMmaM;
 using fused_softmax::kMmaN;
 using fused_softmax::kThreads;
+using fused_softmax::make_k_major_smem_layout;
 using fused_softmax::normalize_rows;
 using fused_softmax::online_row_stats;
 using fused_softmax::store_scores;
+using fused_softmax::zero_tile;
 using std::int64_t;
 using std::runtime_error;
 
@@ -126,10 +128,8 @@ __global__ __launch_bounds__(kThreads) void fused_softmax_recompute_device(
   auto *sAPtr = reinterpret_cast<half_t *>(sRaw);
   auto *sBPtr = sAPtr + static_cast<int64_t>(kBlockM) * kBlockK;
   auto *scoresPtr = reinterpret_cast<float *>(sBPtr + static_cast<int64_t>(kBlockN) * kBlockK);
-  const Tensor sA =
-      make_tensor(make_smem_ptr(sAPtr), make_layout(make_shape(bM, bK), make_stride(bK, Int<1>{})));
-  const Tensor sB =
-      make_tensor(make_smem_ptr(sBPtr), make_layout(make_shape(bN, bK), make_stride(bK, Int<1>{})));
+  const Tensor sA = make_tensor(make_smem_ptr(sAPtr), make_k_major_smem_layout(bM, bK));
+  const Tensor sB = make_tensor(make_smem_ptr(sBPtr), make_k_major_smem_layout(bN, bK));
   Tensor sScores = make_tensor(
       make_smem_ptr(scoresPtr), make_layout(make_shape(bM, bN), make_stride(bN, Int<1>{})));
 
@@ -159,14 +159,22 @@ __global__ __launch_bounds__(kThreads) void fused_softmax_recompute_device(
   const auto rowBase = static_cast<int>(blockIdx.x) * kBlockM;
   const auto threadId = static_cast<int>(threadIdx.x);
 
+  // Under a causal mask, the tile's last row sees no column past this one: column j is visible iff
+  // j <= row + n - m, and the last row is the most permissive row in the block. A kBlockN-wide
+  // column tile that starts past it is entirely masked - its scores would all be -INFINITY and its
+  // contribution to (max, sum) exactly nothing - so both passes can skip computing it. The output
+  // still has to be written, which zero_tile() does at the end.
+  const auto visMax = causal ? rowBase + kBlockM - 1 + (n - m) : n - 1;
+  const auto activeTiles = min(nTiles, max(0, visMax / kBlockN + 1));
+
   for (auto r = threadId; r < kBlockM; r += kThreads) {
     sRowMax[r] = -INFINITY;
     sRowSum[r] = 0.0f;
   }
   __syncthreads();
 
-  // Pass 1: statistics. Every tile is computed, folded into (max, sum), and dropped.
-  for (auto nt = 0; nt < nTiles; ++nt) {
+  // Pass 1: statistics. Every active tile is computed, folded into (max, sum), and dropped.
+  for (auto nt = 0; nt < activeTiles; ++nt) {
     compute_tile(tiledCopy, tiledMma, gA, sA, gB(_, _, nt, _), sB, tCrC, kTiles);
     store_scores(tCrC, tCcC, tCsScores, rowBase, nt * kBlockN, m, n, scale, causal);
     __syncthreads();
@@ -177,12 +185,17 @@ __global__ __launch_bounds__(kThreads) void fused_softmax_recompute_device(
   // Pass 2: recompute and write, now that every row's final statistics are known. Masked columns
   // come back as -INFINITY from store_scores and leave as exactly 0, so this pass needs no mask
   // logic of its own.
-  for (auto nt = 0; nt < nTiles; ++nt) {
+  for (auto nt = 0; nt < activeTiles; ++nt) {
     compute_tile(tiledCopy, tiledMma, gA, sA, gB(_, _, nt, _), sB, tCrC, kTiles);
     store_scores(tCrC, tCcC, tCsScores, rowBase, nt * kBlockN, m, n, scale, causal);
     __syncthreads();
     normalize_rows<kColsPerLane>(scoresPtr, dP, ldP, rowBase, nt * kBlockN, sRowMax, sRowSum);
     __syncthreads();
+  }
+
+  // The tiles past the causal boundary never reached normalize_rows(), so write their zeros here.
+  for (auto nt = activeTiles; nt < nTiles; ++nt) {
+    zero_tile<kBlockN>(dP, ldP, rowBase, nt * kBlockN);
   }
 }
 

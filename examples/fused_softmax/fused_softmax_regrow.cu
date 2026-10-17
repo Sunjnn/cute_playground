@@ -46,6 +46,7 @@ using fused_softmax::kMmaM;
 using fused_softmax::kMmaN;
 using fused_softmax::kThreads;
 using fused_softmax::kWarps;
+using fused_softmax::make_k_major_smem_layout;
 using fused_softmax::store_scores;
 using std::int64_t;
 using std::runtime_error;
@@ -56,44 +57,33 @@ namespace {
 // MMA accumulator and the softmax is a reduction over registers rather than over global memory.
 // That is the entire trick: P is written once and S is never written at all, so this kernel moves
 // 2*M*N bytes against cublas_unfused_softmax's 10*M*N. The price is that the row has to fit, which
-// is what caps n at kBlockN here; fused_softmax_recompute streams the columns instead.
+// is why n is a set of instantiated widths rather than a range; fused_softmax_recompute streams the
+// columns instead.
 //
 // kBlockM, kBlockK, kThreads and the MMA shape come from fused_softmax_mainloop.cuh, which is where
 // the two fused kernels have to agree.
-constexpr int kBlockN = 256;
-
-// Shared memory: the GEMM tiles want (kBlockM + kBlockN) * kBlockK * 2 = 36 KB and the score
-// staging wants kBlockM * kBlockN * 4 = 32 KB, but the two phases never overlap, so one buffer
-// sized to the larger serves both. 36 KB stays under the 48 KB every block gets without opting in
-// through cudaFuncSetAttribute, and two such CTAs fit an SM's 100 KB.
-constexpr int kGemmSmemBytes = (kBlockM + kBlockN) * kBlockK * static_cast<int>(sizeof(__half));
-constexpr int kScoresSmemBytes = kBlockM * kBlockN * static_cast<int>(sizeof(float));
-constexpr int kSmemBytes = kGemmSmemBytes > kScoresSmemBytes ? kGemmSmemBytes : kScoresSmemBytes;
-
-static_assert(kSmemBytes <= 48 * 1024, "bump cudaFuncSetAttribute before growing the tile");
-
-// Registers, measured rather than counted: ptxas reports 64 per thread with no spills for this
-// exact configuration. Counting the fragments statically predicts ~112 - 32 floats of accumulator
-// (kBlockM * kBlockN / kThreads) plus 64 registers of tCrB (4 halves * MMA_N(8) * MMA_K(4)) plus 16
-// of tCrA - and is wrong because the k_block loop is unrolled and each k_block's B fragment is
-// loaded immediately before the gemm that consumes it. Only one k_block's worth stays live, so tCrB
-// costs 16 registers rather than 64.
-//
-// Which means the accumulator, not the operands, is what a wider tile would grow: at kBlockN = 512
-// it doubles to 64 floats and the live B fragment to 32 registers, still short of a spill. The real
-// cost of 512 is shared memory - 68 KB, past the opt-in threshold - and half as many CTAs. So
-// kBlockN = 256 is where the sweep starts, not where it has to stop.
-constexpr int kColsPerLane = kBlockN / 32;
+// Shared memory: the GEMM tiles want (kBlockM + kBlockN) * kBlockK * 2 = 20 KB at kBlockN = 128,
+// 36 KB at 256 and 68 KB at 512; the score staging wants kBlockM * kBlockN * 4 = 16, 32 and 64 KB.
+// The two phases never overlap, so one buffer sized to the larger serves both. 128 and 256 stay
+// under the 48 KB every block gets without opting in through cudaFuncSetAttribute; 512 has to opt
+// in and fits one CTA per SM.
+template <int kBlockN> constexpr int smem_bytes() {
+  constexpr auto gemm = (kBlockM + kBlockN) * kBlockK * static_cast<int>(sizeof(__half));
+  constexpr auto scores = kBlockM * kBlockN * static_cast<int>(sizeof(float));
+  return gemm > scores ? gemm : scores;
+}
 
 // One warp per row, kWarps rows at a time. Every column of a row lives in the one warp that owns
 // it, so both reductions are pure shuffles and need no shared-memory scratch - unlike
 // cublas_unfused_softmax's kernel, where a row spans the whole CTA.
 //
-// Each lane owns kColsPerLane contiguous columns, which is what lets the store go out as __half2
-// pairs. It also means the shared-memory reads stride 32 bytes between lanes and collide in banks;
-// that is a bandwidth problem and not a correctness one, and it is the first thing to fix once the
-// numbers say this kernel is worth tuning.
+// Each lane owns kBlockN / 32 contiguous columns (8 at the default width, 16 at 512), which is what
+// lets the store go out as __half2 pairs. It also means the shared-memory reads stride 32 bytes
+// between lanes and collide in banks; that is a bandwidth problem and not a correctness one, and it
+// is the next thing to fix here now that the mainloop no longer dominates.
+template <int kBlockN>
 __device__ void softmax_rows(const float *scores, __half *dP, int ldP, int rowBase) {
+  constexpr int kColsPerLane = kBlockN / 32;
   const auto warpId = static_cast<int>(threadIdx.x) / 32;
   const auto laneId = static_cast<int>(threadIdx.x) % 32;
   const auto laneCol = laneId * kColsPerLane;
@@ -143,6 +133,7 @@ __device__ void softmax_rows(const float *scores, __half *dP, int ldP, int rowBa
 // The scores land in shared memory row-major so softmax_rows() can walk a row contiguously. The
 // GEMM tiles are K-major for the same reason on their side: the copy atom moves 8 contiguous
 // halves, and both operands are K-contiguous in global memory.
+template <int kBlockN>
 __global__ __launch_bounds__(kThreads) void fused_softmax_regrow_device(
     const __half *__restrict__ dQ,
     int ldQ,
@@ -178,10 +169,8 @@ __global__ __launch_bounds__(kThreads) void fused_softmax_regrow_device(
 
   auto *sAPtr = reinterpret_cast<half_t *>(sRaw);
   auto *sBPtr = sAPtr + static_cast<int64_t>(kBlockM) * kBlockK;
-  const Tensor sA =
-      make_tensor(make_smem_ptr(sAPtr), make_layout(make_shape(bM, bK), make_stride(bK, Int<1>{})));
-  const Tensor sB =
-      make_tensor(make_smem_ptr(sBPtr), make_layout(make_shape(bN, bK), make_stride(bK, Int<1>{})));
+  const Tensor sA = make_tensor(make_smem_ptr(sAPtr), make_k_major_smem_layout(bM, bK));
+  const Tensor sB = make_tensor(make_smem_ptr(sBPtr), make_k_major_smem_layout(bN, bK));
 
   // One 128-bit atom is 8 halves, and the thread layout puts K fastest so a warp's eight lanes
   // cover 128 contiguous bytes of one row rather than eight separate rows.
@@ -220,7 +209,47 @@ __global__ __launch_bounds__(kThreads) void fused_softmax_regrow_device(
   store_scores(tCrC, tCcC, tCsScores, rowBase, 0, m, n, scale, causal);
   __syncthreads();
 
-  softmax_rows(scoresPtr, dP, ldP, rowBase);
+  softmax_rows<kBlockN>(scoresPtr, dP, ldP, rowBase);
+}
+
+// Launch one row-width instantiation. The 512-wide kernel is the only one that needs more than the
+// 48 KB a block gets without asking, and cudaFuncSetAttribute is per-function, so the opt-in is
+// done once here rather than on every call - it would otherwise land in the timed path.
+template <int kBlockN>
+void launch_regrow(
+    int m,
+    int n,
+    int k,
+    const __half *dQ,
+    int ldQ,
+    const __half *dK,
+    int ldK,
+    __half *dP,
+    int ldP,
+    float scale,
+    bool causal) {
+  constexpr auto kSmemBytes = smem_bytes<kBlockN>();
+  static_assert(kSmemBytes <= 99 * 1024, "the score staging has to fit one SM's shared memory");
+
+  static const auto sSmemConfigured = [] {
+    constexpr auto kBytes = smem_bytes<kBlockN>();
+    if constexpr (kBytes > 48 * 1024) {
+      return cudaFuncSetAttribute(
+                 fused_softmax_regrow_device<kBlockN>,
+                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                 kBytes) == cudaSuccess;
+    } else {
+      return true;
+    }
+  }();
+  if (!sSmemConfigured) {
+    throw runtime_error("fused_softmax_regrow could not opt in to the shared memory it needs");
+  }
+
+  const dim3 dimBlock(kThreads);
+  const dim3 dimGrid(m / kBlockM);
+  fused_softmax_regrow_device<kBlockN>
+      <<<dimGrid, dimBlock, kSmemBytes>>>(dQ, ldQ, dK, ldK, dP, ldP, m, n, k, scale, causal);
 }
 
 } // namespace
@@ -239,10 +268,11 @@ void fused_softmax_regrow(
     bool causal) {
   static_assert(sizeof(__half) == sizeof(half_t), "the casts above need these to match");
 
-  // The whole row has to be one CTA tile, so n is not a range here but a single supported value.
-  // Relaxing it means either a second instantiation or the recompute variant.
-  if (n != kBlockN) {
-    throw runtime_error("fused_softmax_regrow holds a whole row on chip, so n must be 256");
+  // The whole row has to be one CTA tile, so n is a small set of instantiated widths rather than a
+  // range: 128, 256 and 512 are the widths whose score staging fits one SM's shared memory.
+  if (n != 128 && n != 256 && n != 512) {
+    throw runtime_error(
+        "fused_softmax_regrow holds a whole row on chip, so n must be 128, 256 or 512");
   }
   if (m % kBlockM != 0) {
     throw runtime_error("fused_softmax_regrow needs m to be a multiple of 32");
@@ -255,10 +285,17 @@ void fused_softmax_regrow(
     throw runtime_error("fused_softmax_regrow needs ldP to be even");
   }
 
-  const dim3 dimBlock(kThreads);
-  const dim3 dimGrid(m / kBlockM);
-  fused_softmax_regrow_device<<<dimGrid, dimBlock, kSmemBytes>>>(
-      dQ, ldQ, dK, ldK, dP, ldP, m, n, k, scale, causal);
+  switch (n) {
+  case 128:
+    launch_regrow<128>(m, n, k, dQ, ldQ, dK, ldK, dP, ldP, scale, causal);
+    break;
+  case 256:
+    launch_regrow<256>(m, n, k, dQ, ldQ, dK, ldK, dP, ldP, scale, causal);
+    break;
+  default:
+    launch_regrow<512>(m, n, k, dQ, ldQ, dK, ldK, dP, ldP, scale, causal);
+    break;
+  }
   auto error = cudaDeviceSynchronize();
   if (error != cudaSuccess) {
     throw runtime_error(cudaGetErrorString(error));

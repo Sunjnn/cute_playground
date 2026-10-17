@@ -100,6 +100,14 @@ Reference make_reference(
 
 double
 max_rel_diff(const Reference &ref, int m, int n, const host_vector<__half> &hOut, int ldOut) {
+  // P is fp16, so probabilities below 2^-14 are stored with the subnormal spacing 2^-24 and their
+  // relative error against a double reference is dominated by the format, not by the kernel: at
+  // n = 8192 the row sum makes the smallest probabilities ~2.5e-5, where one subnormal ulp is
+  // already 1.2e-3 relative. Flooring the denominator at the format's smallest normal judges those
+  // elements against the resolution fp16 actually has there - one ulp is 2^-24, so the 1e-3
+  // threshold allows about one subnormal ulp, exactly as it allows about one normal ulp above
+  // 2^-14.
+  constexpr auto kFp16MinNormal = 6.103515625e-05; // 2^-14
   auto maxRel = 0.0;
   for (auto i = 0; i < m; ++i) {
     const auto *const expectedRow = &ref.probs[static_cast<size_t>(i) * static_cast<size_t>(n)];
@@ -107,7 +115,8 @@ max_rel_diff(const Reference &ref, int m, int n, const host_vector<__half> &hOut
     for (auto j = 0; j < n; ++j) {
       const auto expected = static_cast<double>(expectedRow[j]);
       const auto actual = static_cast<double>(__half2float(actualRow[j]));
-      const auto dev = expected > 0.0 ? fabs(actual - expected) / expected : fabs(actual);
+      const auto denominator = expected > kFp16MinNormal ? expected : kFp16MinNormal;
+      const auto dev = fabs(actual - expected) / denominator;
       if (isnan(dev) || dev > maxRel) {
         maxRel = dev;
       }

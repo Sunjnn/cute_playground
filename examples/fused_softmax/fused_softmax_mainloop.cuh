@@ -33,6 +33,24 @@ constexpr int kMmaM = kMmaAtomsM * 16;
 constexpr int kMmaN = kMmaAtomsN * 8;
 constexpr int kMmaK = 16;
 
+// The layout both kernels' operand tiles live in: a 128-bit-swizzled, K-major half tile. The
+// swizzle is what makes the 16-byte vectors that ldmatrix reads - and that the global-to-shared
+// copy writes - land in distinct banks. The atom is 8 rows x 64 halves, the shape SM75_U32x4_LDSM_N
+// expects, tiled to the (bM, bK) of the CTA tile. Swizzle<3,3,3> XORs offset bits [3,6) with bits
+// [6,9), so the low three bits are untouched: an 8-half (16-byte) vector stays contiguous and
+// aligned, and only its position within a 128-byte group changes. That is why a plain 128-bit copy
+// can write this layout.
+template <class BShape, class KShape>
+CUTE_HOST_DEVICE constexpr auto make_k_major_smem_layout(BShape const &bM, KShape const &bK) {
+  return cute::tile_to_shape(
+      cute::composition(
+          cute::Swizzle<3, 3, 3>{},
+          cute::Layout<
+              cute::Shape<cute::_8, cute::Shape<cute::_8, cute::_8>>,
+              cute::Stride<cute::_8, cute::Stride<cute::_1, cute::_64>>>{}),
+      cute::make_shape(bM, bK));
+}
+
 // Scale, mask, and write the accumulator to shared memory in one pass. The identity tensor behind
 // tCcC is what turns a flat fragment index into the (row, column) it belongs to, which is the only
 // way to ask whether the causal mask bites at that particular element; rowBase and colBase place
@@ -166,6 +184,26 @@ __device__ void normalize_rows(
   }
 }
 
+// Write zeros to one kBlockM x kBlockN tile of P. A fully masked causal tile still has to reach the
+// output, and zero is exactly what normalize_rows() would have stored for it: its columns arrive
+// from store_scores() as -INFINITY, __expf(-INFINITY - max) is exactly 0, and 0 * invSum is 0.
+// Skipping the tile's compute is therefore unobservable, but skipping its store would leave the NaN
+// the harness pre-fills.
+template <int kBlockN> __device__ void zero_tile(__half *dP, int ldP, int rowBase, int colBase) {
+  static_assert(kBlockN % 2 == 0, "the store goes out as __half2 pairs");
+  constexpr int kHalf2PerRow = kBlockN / 2;
+  static_assert(kThreads % kHalf2PerRow == 0, "one step has to cover whole rows");
+  constexpr int kRowsPerStep = kThreads / kHalf2PerRow;
+
+  const auto threadId = static_cast<int>(threadIdx.x);
+  const auto laneCol = (threadId % kHalf2PerRow) * 2;
+  const auto zero = __floats2half2_rn(0.0f, 0.0f);
+  for (auto r = threadId / kHalf2PerRow; r < kBlockM; r += kRowsPerStep) {
+    *reinterpret_cast<__half2 *>(
+        dP + static_cast<std::int64_t>(rowBase + r) * ldP + colBase + laneCol) = zero;
+  }
+}
+
 // One GEMM over the whole of K for a single (row tile, column tile), leaving the scaled-nothing,
 // masked-nothing accumulator in tCrC. gB is expected to be already sliced to one column tile, which
 // is what makes this indifferent to whether the caller owns the whole row (fused_softmax_regrow) or
@@ -206,10 +244,28 @@ __device__ void compute_tile(
   auto tBsB = thrCopy.partition_D(sB); // (CPY,CPY_N,CPY_K)
 
   const auto thrMma = tiledMma.get_slice(threadIdx.x);
-  auto tCsA = thrMma.partition_A(sA);          // (MMA,MMA_M,MMA_K)
-  auto tCsB = thrMma.partition_B(sB);          // (MMA,MMA_N,MMA_K)
   auto tCrA = thrMma.partition_fragment_A(sA); // (MMA,MMA_M,MMA_K)
   auto tCrB = thrMma.partition_fragment_B(sB); // (MMA,MMA_N,MMA_K)
+
+  // The shared-to-register operand fetches go through ldmatrix: one instruction moves a group of
+  // 8 x 8 x 16-bit smem tiles per warp, where an elementwise copy issues one scalar load per
+  // element. That is why the smem layouts above are swizzled - ldmatrix reads 16-byte rows per
+  // lane, and the swizzle is what keeps those rows in distinct banks across the warp.
+  //
+  // A takes x4 (8 halves per lane per fetch) because this MMA owns 8 halves of A per k-step; B
+  // takes x2 (4 halves) because its 2 x 4 atom layout already spans the full 32-column tile,
+  // leaving each lane only the 4 halves of its own atom. Asking x4 of B is a static error: the
+  // tiled copy would have fewer values than the atom moves.
+  const auto s2rAtomA = cute::Copy_Atom<cute::SM75_U32x4_LDSM_N, cute::half_t>{};
+  const auto s2rAtomB = cute::Copy_Atom<cute::SM75_U32x2_LDSM_N, cute::half_t>{};
+  const auto s2rCopyA = cute::make_tiled_copy_A(s2rAtomA, tiledMma);
+  const auto s2rCopyB = cute::make_tiled_copy_B(s2rAtomB, tiledMma);
+  const auto thrS2rA = s2rCopyA.get_slice(threadIdx.x);
+  const auto thrS2rB = s2rCopyB.get_slice(threadIdx.x);
+  auto tXsA = thrS2rA.partition_S(sA); // (CPY,MMA_M,MMA_K)
+  auto tXsB = thrS2rB.partition_S(sB); // (CPY,MMA_N,MMA_K)
+  auto tXrA = thrS2rA.retile_D(tCrA);  // (CPY,MMA_M,MMA_K)
+  auto tXrB = thrS2rB.retile_D(tCrB);  // (CPY,MMA_N,MMA_K)
 
   cute::clear(tCrC);
   for (auto kt = 0; kt < kTiles; ++kt) {
@@ -221,10 +277,8 @@ __device__ void compute_tile(
 
     CUTE_UNROLL
     for (auto kb = 0; kb < cute::size<2>(tCrA); ++kb) {
-      // Elementwise rather than through an SM75_U32x4_LDSM_N atom: ldmatrix needs a swizzled smem
-      // layout to be worth anything, and this build has none.
-      cute::copy(tCsA(_, _, kb), tCrA(_, _, kb));
-      cute::copy(tCsB(_, _, kb), tCrB(_, _, kb));
+      cute::copy(s2rAtomA, tXsA(_, _, kb), tXrA(_, _, kb));
+      cute::copy(s2rAtomB, tXsB(_, _, kb), tXrB(_, _, kb));
       cute::gemm(tiledMma, tCrA(_, _, kb), tCrB(_, _, kb), tCrC);
     }
     __syncthreads();
