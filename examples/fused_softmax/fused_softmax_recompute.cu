@@ -74,10 +74,11 @@ namespace {
 // than asserting it.
 
 // Column tile width. The kernel is instantiated at 128 and 64:
-//   - 128 halves the per-tile overhead (barriers, score staging) and fits two CTAs per SM;
-//   - 64 halves the tile count per CTA and fits four, which wins exactly when the 128-wide grid
-//     would spill into a second, mostly empty wave. The host dispatch below measures that point
-//     with the occupancy API rather than hardcoding a shape.
+//   - 128 is the default: fewer, larger tiles per CTA, and with the aliased score buffer it fits
+//     four CTAs per SM;
+//   - 64 exists for widths that are a multiple of 64 but not 128 (192, 320, ...). It was also the
+//     large-grid choice before the score buffer was aliased; once the 128-wide residency reached
+//     four it measured slower at every shape where both fit.
 // Both fit under the 48 KB a block gets without opting in, so neither needs an attribute.
 template <int kBlockN> constexpr int operand_smem_bytes() {
   return (kBlockM + kBlockN) * kBlockK * static_cast<int>(sizeof(__half));
@@ -87,19 +88,23 @@ template <int kBlockN> constexpr int scores_smem_bytes() {
   return kBlockM * kBlockN * static_cast<int>(sizeof(float));
 }
 
-// The three buffers are live at the same time here, unlike in fused_softmax_regrow where the score
-// staging can alias the operand tiles: the next tile's operands are being loaded while the current
-// tile's scores are still being reduced. The operand buffers are staged kStages deep, so the ring
-// is kStages * operand + scores: 20 KB for (64, 1) - four CTAs per SM - and 36 KB for (128, 1).
+// The score staging aliases the operand buffers, as in fused_softmax_regrow. With one cp.async
+// stage they are disjoint in time: a tile's operands are consumed by its GEMM before store_scores()
+// writes the scores, and the next tile's copy is only issued after normalize_rows() has read them
+// (the last-tile reuse follows the same order across the two passes). That drops the footprint from
+// operand + scores (36 KB at 128 wide) to their maximum (20 KB), which is what takes the 128-wide
+// build from two CTAs per SM to four.
 //
 // kStages is 1 for both instantiations today. A two-stage ring was measured and lost a CTA of
-// residency at each width (64: 4 -> 3, 128: 2 -> 1), which cost more at the large shapes than the
-// overlap bought; the parameter stays so the trade can be retried when the tile changes. What did
-// pay is the cp.async copy itself, with one commit group per tile and a wait before the read: it
-// removed the synchronous load/store chain and is worth 7-18% on the 128-wide shapes with fewer
-// CTAs (1024 x 2048, 1024 x 8192, and the causal squares).
+// residency at each width, which cost more at the large shapes than the overlap bought; the
+// parameter stays so the trade can be retried when the tile changes. What did pay is the cp.async
+// copy itself, with one commit group per tile and a wait before the read: it removed the
+// synchronous load/store chain and is worth 7-18% on the 128-wide shapes with fewer CTAs
+// (1024 x 2048, 1024 x 8192, and the causal squares).
 template <int kBlockN, int kStages> constexpr int smem_bytes() {
-  return kStages * operand_smem_bytes<kBlockN>() + scores_smem_bytes<kBlockN>();
+  constexpr auto operands = kStages * operand_smem_bytes<kBlockN>();
+  constexpr auto scores = scores_smem_bytes<kBlockN>();
+  return operands > scores ? operands : scores;
 }
 
 static_assert(
@@ -161,8 +166,9 @@ __global__ __launch_bounds__(kThreads) void fused_softmax_recompute_device(
 
   auto *sAPtr = reinterpret_cast<half_t *>(sRaw);
   auto *sBPtr = sAPtr + static_cast<int64_t>(kBlockM) * kBlockK * kStages;
-  auto *scoresPtr =
-      reinterpret_cast<float *>(sBPtr + static_cast<int64_t>(kBlockN) * kBlockK * kStages);
+  // The score staging aliases the operands; see smem_bytes() for why their lifetimes do not
+  // overlap.
+  auto *scoresPtr = reinterpret_cast<float *>(sRaw);
   const Tensor sA = make_tensor(make_smem_ptr(sAPtr), make_k_major_smem_layout<kStages>(bM, bK));
   const Tensor sB = make_tensor(make_smem_ptr(sBPtr), make_k_major_smem_layout<kStages>(bN, bK));
   Tensor sScores = make_tensor(
@@ -310,31 +316,12 @@ void fused_softmax_recompute(
     throw runtime_error("fused_softmax_recompute needs ldP to be even");
   }
 
-  // How many CTAs of the 128-wide kernel one wave of the device holds. Measured once: it is the
-  // crossover the dispatch needs, and the answer depends on the device and on the kernel's
-  // registers and shared memory, not on anything a hardcoded threshold could know.
-  static const auto sWave128 = [] {
-    auto blocks = 2; // the shape this kernel was tuned around, if the query fails
-    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &blocks, fused_softmax_recompute_device<128, 1>, kThreads, smem_bytes<128, 1>()) !=
-        cudaSuccess) {
-      blocks = 2;
-    }
-    auto device = 0;
-    auto sms = 1;
-    cudaGetDevice(&device);
-    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
-    return blocks * sms;
-  }();
-
-  const auto rowBlocks = m / kBlockM;
-  // A grid that fits one 128-wide wave keeps the wider tile: fewer tiles per CTA, less per-tile
-  // overhead. Once it would spill into a second wave, the narrow tile's four CTAs per SM and half
-  // the tiles per CTA give a shorter makespan. A causal shape keeps 128 for a different reason:
-  // the row blocks are reversed so the heavy ones run first (see the kernel), which already hides
-  // the imbalance, and a causal CTA's work is not the full row anyway.
-  const auto useNarrow = n % 128 != 0 || (!causal && rowBlocks > sWave128);
-  if (useNarrow) {
+  // 128 wide is the default: with the score staging aliased onto the operands it holds four CTAs
+  // per SM, and it halves the number of tiles per CTA against the 64-wide build. The narrow
+  // instantiation exists for widths that are a multiple of 64 but not 128 (192, 320, ...); it
+  // measured slower at every shape where both fit once the alias raised the 128-wide residency,
+  // so there is no occupancy-based dispatch to make.
+  if (n % 128 != 0) {
     launch_recompute<64, 1>(m, n, k, dQ, ldQ, dK, ldK, dP, ldP, scale, causal);
   } else {
     launch_recompute<128, 1>(m, n, k, dQ, ldQ, dK, ldK, dP, ldP, scale, causal);
