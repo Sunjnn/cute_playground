@@ -35,6 +35,7 @@ using cute::Tensor;
 using cute::Tile;
 using cute::uint128_t;
 using cute::X;
+using fused_softmax::accumulate_tile_stats;
 using fused_softmax::compute_tile_async;
 using fused_softmax::kBlockK;
 using fused_softmax::kBlockM;
@@ -46,7 +47,7 @@ using fused_softmax::kMmaN;
 using fused_softmax::kThreads;
 using fused_softmax::make_k_major_smem_layout;
 using fused_softmax::normalize_rows;
-using fused_softmax::online_row_stats;
+using fused_softmax::stage_prepared_scores;
 using fused_softmax::store_scores;
 using fused_softmax::zero_tile;
 using std::int64_t;
@@ -59,10 +60,10 @@ namespace {
 // at kBlockM = 32 that caps n at 256 before shared memory needs opting in.
 //
 // This one streams the columns instead. It walks all of n twice: the first pass computes each tile,
-// folds it into the row's running (max, sum) with online_row_stats, and throws the tile away; the
-// second recomputes it and writes exp(s - max) / sum directly. So P is still written exactly once
-// and S is still never written at all - the 2*M*N floor is kept - and the price is 2x the
-// multiply-adds instead of extra traffic.
+// folds it into the row's running (max, sum) straight from the accumulator, and throws the tile
+// away; the second recomputes it and writes exp(s - max) / sum directly. So P is still written
+// exactly once and S is still never written at all - the 2*M*N floor is kept - and the price is 2x
+// the multiply-adds instead of extra traffic.
 //
 // Whether that trade is worth it is a roofline question, not a matter of taste. The problem does
 // 2*M*N*K flops and moves 2*M*N bytes, so its arithmetic intensity is K flops per byte; recomputing
@@ -125,6 +126,9 @@ __global__ __launch_bounds__(kThreads) void fused_softmax_recompute_device(
   extern __shared__ __align__(16) char sRaw[];
   __shared__ float sRowMax[kBlockM];
   __shared__ float sRowSum[kBlockM];
+  // Per-tile reduction scratch for pass 1: one max and one sum per row per N atom.
+  __shared__ float sTileMax[2][kBlockM][kMmaAtomsN];
+  __shared__ float sTileSum[2][kBlockM][kMmaAtomsN];
 
   const auto bM = Int<kBlockM>{};
   const auto bN = Int<kBlockN>{};
@@ -206,17 +210,33 @@ __global__ __launch_bounds__(kThreads) void fused_softmax_recompute_device(
   }
   __syncthreads();
 
-  // Pass 1: statistics. Every active tile is computed, folded into (max, sum), and dropped.
+  // Pass 1: statistics from the accumulator. The tile is folded into (max, sum) straight out of
+  // registers, so no score staging is written or read; the one exception is the last active tile,
+  // which is staged because pass 2 reuses it.
   for (auto nt = 0; nt < activeTiles; ++nt) {
     compute_tile_async<kStages>(tiledCopy, tiledMma, gA, sA, gB(_, _, nt, _), sB, tCrC, kTiles);
-    store_scores(tCrC, tCcC, tCsScores, rowBase, nt * kBlockN, m, n, scale, causal);
-    __syncthreads();
-    online_row_stats<kBlockN / 32>(scoresPtr, sRowMax, sRowSum);
-    __syncthreads();
+    accumulate_tile_stats(
+        tCrC,
+        tCcC,
+        sTileMax,
+        sTileSum,
+        sRowMax,
+        sRowSum,
+        nt & 1,
+        rowBase,
+        nt * kBlockN,
+        m,
+        n,
+        scale,
+        causal);
+    if (nt + 1 == activeTiles) {
+      stage_prepared_scores(tCrC, tCsScores);
+    }
   }
+  __syncthreads();
 
   // Pass 2: write, now that every row's final statistics are known. The last active tile is still
-  // in shared memory from pass 1 - online_row_stats only read it - so it is normalized in place
+  // in shared memory from pass 1 - the statistics pass only read it - so it is normalized in place
   // instead of being recomputed, and is consumed before the loop below stores anything. That saves
   // one GEMM and one copy per CTA: a sixth of the second pass at n = 256 (two tiles) and all of it
   // at n = 128 (one tile).

@@ -7,11 +7,13 @@
 
 #include "cute/tensor.hpp" // IWYU pragma: keep
 
-// What the two fused kernels share. Both compute S = Q K^T with the same MMA configuration and
-// both hand the accumulator to shared memory through the same scale-and-mask step; they differ only
-// in what happens next, which is why the softmax itself is not here.
+// What the two fused kernels share. Both compute S = Q K^T with the same MMA configuration and the
+// same causal predicate; they differ in where the row statistics come from. fused_softmax_regrow
+// stages its whole row through store_scores() and reduces it warp-per-row, while
+// fused_softmax_recompute folds each streamed tile into the statistics straight from the
+// accumulator (accumulate_tile_stats) and stages only the one tile pass 2 reuses.
 //
-// The causal predicate is the part worth sharing. It is one comparison, but if the two kernels ever
+// The causal predicate is worth sharing. It is one comparison, but if the two kernels ever
 // disagreed about it the harness would report a mismatch with no way to tell a wrong GEMM from a
 // wrong mask, which is exactly the ambiguity Reference::scores exists to remove.
 namespace fused_softmax {
@@ -95,65 +97,142 @@ __device__ void store_scores(
   }
 }
 
-// Fold one kColsPerLane*32-column tile of scores into the running (max, sum) of each of its rows.
-// Both arrays hold one float per row and live in shared memory; they are the online-softmax state,
-// so a tile can be folded in as soon as it is computed and then thrown away.
+// Fold the current tile's accumulator into the row statistics without staging it. This is what
+// pass 1 uses instead of staging the tile and reducing it warp-per-row: the accumulator elements
+// are reduced per row in registers, first across the four lanes that share a row (a shuffle), then
+// across the four N-atom warps (a 32 x 4 shared partial array). The 16 KB score staging and its
+// read disappear; pass 1 keeps the scores only for the one tile pass 2 reuses.
 //
-// The correction factor is what makes that legal: rescaling the running sum into the new maximum's
-// frame costs one exp per row per tile, and it is why this needs no second look at a tile it has
-// already discarded. On the first tile rowMax is -INFINITY and __expf(-INFINITY - finite) is
-// exactly 0, so the running sum starts from nothing with no special case. A fully masked tile
-// leaves tileMax at -INFINITY, so rowMax does not move, the correction is exp(0) = 1, and the tile
-// contributes 0 to the sum.
+// The mapping this relies on is this MMA's C fragment: each thread owns two rows eight apart and
+// two adjacent columns per N atom per 32-column repetition, and the four lanes with the same
+// laneId/4 share a row. warpId / kMmaAtomsM selects the N atom, warpId % kMmaAtomsM the 16-row
+// group. The rows themselves are read back from the coordinate tensor, not re-derived.
 //
-// The one state this cannot survive is a row with no visible column at all, where both maxima stay
-// -INFINITY and the correction becomes exp(-INFINITY + INFINITY) = NaN. main.cu rejects m > n under
-// a causal mask, and without one every column is visible, so every row sees column 0 in the first
-// tile and rowMax is finite from then on.
-template <int kColsPerLane>
-__device__ void online_row_stats(const float *scores, float *rowMax, float *rowSum) {
-  static_assert(kColsPerLane % 2 == 0, "the store goes out as __half2 pairs");
-  constexpr int kCols = kColsPerLane * 32;
-
+// The partial arrays are double-buffered by tile parity, which is what keeps this at two barriers
+// per tile: the next tile writes the other half of the buffers, and its own max barrier makes this
+// tile's state update visible before anything reads rowMax/rowSum again. The caller's barrier after
+// the pass-1 loop covers the last tile.
+template <class TCrC, class TCcC>
+__device__ void accumulate_tile_stats(
+    TCrC &tCrC,
+    const TCcC &tCcC,
+    float (&tileMax)[2][kBlockM][kMmaAtomsN],
+    float (&tileSum)[2][kBlockM][kMmaAtomsN],
+    float *rowMax,
+    float *rowSum,
+    int parity,
+    int rowBase,
+    int colBase,
+    int m,
+    int n,
+    float scale,
+    bool causal) {
   const auto warpId = static_cast<int>(threadIdx.x) / 32;
   const auto laneId = static_cast<int>(threadIdx.x) % 32;
-  const auto laneCol = laneId * kColsPerLane;
+  const auto nAtom = warpId / kMmaAtomsM;
 
-  for (auto r = warpId; r < kBlockM; r += kWarps) {
-    const auto *row = scores + static_cast<std::int64_t>(r) * kCols + laneCol;
+  // The two rows this thread owns: element 0 is the first row, element 2 (after the two adjacent
+  // columns of the first) the second.
+  const auto rowA = static_cast<int>(cute::get<0>(tCcC(0)));
+  const auto rowB = static_cast<int>(cute::get<0>(tCcC(2)));
 
-    float values[kColsPerLane];
-    CUTE_UNROLL
-    for (auto c = 0; c < kColsPerLane; ++c) {
-      values[c] = row[c];
+  // Tile row maximum. The scaled and masked value is written back into the accumulator so the sum
+  // below - and the staging of the tile pass 2 reuses - do not have to redo that work.
+  auto maxA = -INFINITY;
+  auto maxB = -INFINITY;
+  CUTE_UNROLL
+  for (auto i = 0; i < cute::size(tCrC); ++i) {
+    const auto localRow = static_cast<int>(cute::get<0>(tCcC(i)));
+    auto value = tCrC(i) * scale;
+    if (causal && colBase + static_cast<int>(cute::get<1>(tCcC(i))) > rowBase + localRow + n - m) {
+      value = -INFINITY;
     }
-
-    auto tileMax = -INFINITY;
-    CUTE_UNROLL
-    for (const auto value : values) {
-      tileMax = fmaxf(tileMax, value);
+    tCrC(i) = value;
+    if (localRow == rowA) {
+      maxA = fmaxf(maxA, value);
+    } else {
+      maxB = fmaxf(maxB, value);
     }
+  }
 #pragma unroll
-    for (auto offset = 16; offset > 0; offset /= 2) {
-      tileMax = fmaxf(tileMax, __shfl_xor_sync(0xffffffffu, tileMax, offset));
-    }
+  for (auto offset = 1; offset < 4; offset *= 2) {
+    maxA = fmaxf(maxA, __shfl_xor_sync(0xffffffffu, maxA, offset));
+    maxB = fmaxf(maxB, __shfl_xor_sync(0xffffffffu, maxB, offset));
+  }
+  if (laneId % 4 == 0) {
+    tileMax[parity][rowA][nAtom] = maxA;
+    tileMax[parity][rowB][nAtom] = maxB;
+  }
+  __syncthreads();
 
-    const auto oldMax = rowMax[r];
-    const auto newMax = fmaxf(oldMax, tileMax);
-    const auto correction = __expf(oldMax - newMax);
+  // Combine the four N-atom partials and fold in the running maximum. The correction factor is the
+  // same online-softmax update the warp-per-row reduction used to perform.
+  auto tileMaxA = tileMax[parity][rowA][0];
+  auto tileMaxB = tileMax[parity][rowB][0];
+  CUTE_UNROLL
+  for (auto part = 1; part < kMmaAtomsN; ++part) {
+    tileMaxA = fmaxf(tileMaxA, tileMax[parity][rowA][part]);
+    tileMaxB = fmaxf(tileMaxB, tileMax[parity][rowB][part]);
+  }
+  const auto oldMaxA = rowMax[rowA];
+  const auto oldMaxB = rowMax[rowB];
+  const auto newMaxA = fmaxf(oldMaxA, tileMaxA);
+  const auto newMaxB = fmaxf(oldMaxB, tileMaxB);
+  const auto correctionA = __expf(oldMaxA - newMaxA);
+  const auto correctionB = __expf(oldMaxB - newMaxB);
 
-    auto tileSum = 0.0f;
-    CUTE_UNROLL
-    for (const auto value : values) {
-      tileSum += __expf(value - newMax);
+  // Exponentiate against the new maximum and sum per row, from the values prepared above.
+  auto sumA = 0.0f;
+  auto sumB = 0.0f;
+  CUTE_UNROLL
+  for (auto i = 0; i < cute::size(tCrC); ++i) {
+    const auto value = tCrC(i);
+    if (static_cast<int>(cute::get<0>(tCcC(i))) == rowA) {
+      sumA += __expf(value - newMaxA);
+    } else {
+      sumB += __expf(value - newMaxB);
     }
+  }
 #pragma unroll
-    for (auto offset = 16; offset > 0; offset /= 2) {
-      tileSum += __shfl_xor_sync(0xffffffffu, tileSum, offset);
-    }
+  for (auto offset = 1; offset < 4; offset *= 2) {
+    sumA += __shfl_xor_sync(0xffffffffu, sumA, offset);
+    sumB += __shfl_xor_sync(0xffffffffu, sumB, offset);
+  }
+  if (laneId % 4 == 0) {
+    tileSum[parity][rowA][nAtom] = sumA;
+    tileSum[parity][rowB][nAtom] = sumB;
+  }
+  __syncthreads();
 
-    rowMax[r] = newMax;
-    rowSum[r] = rowSum[r] * correction + tileSum;
+  auto sumTotalA = tileSum[parity][rowA][0];
+  auto sumTotalB = tileSum[parity][rowB][0];
+  CUTE_UNROLL
+  for (auto part = 1; part < kMmaAtomsN; ++part) {
+    sumTotalA += tileSum[parity][rowA][part];
+    sumTotalB += tileSum[parity][rowB][part];
+  }
+
+  // Only one N atom per row writes the state. The other three would store identical values, but
+  // their read-modify-write of rowSum would race with this one.
+  if (nAtom == 0 && laneId % 4 == 0) {
+    rowMax[rowA] = newMaxA;
+    rowMax[rowB] = newMaxB;
+    rowSum[rowA] = rowSum[rowA] * correctionA + sumTotalA;
+    rowSum[rowB] = rowSum[rowB] * correctionB + sumTotalB;
+  }
+  // No trailing barrier: the next tile's partial arrays are the other parity, and its max barrier
+  // makes this update visible before anything reads rowMax/rowSum again. The caller's barrier after
+  // the pass-1 loop covers the last tile.
+}
+
+// Copy an already-scaled, already-masked accumulator to shared memory. accumulate_tile_stats()
+// leaves the fragment in that form so the one tile pass 2 reuses does not have to redo the
+// transform.
+template <class TCrC, class TCsScores>
+__device__ void stage_prepared_scores(const TCrC &tCrC, TCsScores &tCsScores) {
+  CUTE_UNROLL
+  for (auto i = 0; i < cute::size(tCrC); ++i) {
+    tCsScores(i) = tCrC(i);
   }
 }
 
