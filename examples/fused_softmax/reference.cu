@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <vector>
 
 using std::exp;
@@ -17,9 +18,10 @@ using thrust::host_vector;
 namespace {
 
 // Masked positions have to survive being exponentiated and then divided by a finite row sum, so
-// they carry -HUGE_VAL rather than a NaN: exp(-HUGE_VAL - rowMax) is exactly 0, which is what a
-// masked probability should be.
-constexpr double kMasked = -HUGE_VAL;
+// they carry -infinity rather than a NaN: exp(-infinity - rowMax) is exactly 0, which is what a
+// masked probability should be. Use numeric_limits rather than HUGE_VAL: the UCRT macro expands
+// to (double)(float)(1e+300), which nvcc rejects in a constant expression.
+constexpr double kMasked = -std::numeric_limits<double>::infinity();
 
 } // namespace
 
