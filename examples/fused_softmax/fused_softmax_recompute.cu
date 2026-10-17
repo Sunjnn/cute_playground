@@ -72,24 +72,34 @@ namespace {
 // free. At K = 128 that needs B > 256, which is roughly where a consumer Blackwell's fp16 tensor
 // throughput against its 448 GB/s of DRAM lands - close enough that the README measures it rather
 // than asserting it.
-constexpr int kBlockN = 128;
+// Column tile width. The kernel is instantiated at 128 and 64:
+//   - 128 halves the per-tile overhead (barriers, score staging) and fits two CTAs per SM;
+//   - 64 halves the tile count per CTA and fits four, which wins exactly when the 128-wide grid
+//     would spill into a second, mostly empty wave. The host dispatch below measures that point
+//     with the occupancy API rather than hardcoding a shape.
+// Both fit under the 48 KB a block gets without opting in, so neither needs an attribute.
+template <int kBlockN> constexpr int operand_smem_bytes() {
+  return (kBlockM + kBlockN) * kBlockK * static_cast<int>(sizeof(__half));
+}
+
+template <int kBlockN> constexpr int scores_smem_bytes() {
+  return kBlockM * kBlockN * static_cast<int>(sizeof(float));
+}
 
 // The three buffers are live at the same time here, unlike in fused_softmax_regrow where the score
 // staging can alias the operand tiles: the next tile's operands are being loaded while the current
-// tile's scores are still being reduced. (32 + 128) * 64 * 2 + 32 * 128 * 4 = 36 KB, under the
-// 48 KB every block gets without opting in.
-constexpr int kOperandSmemBytes = (kBlockM + kBlockN) * kBlockK * static_cast<int>(sizeof(__half));
-constexpr int kScoresSmemBytes = kBlockM * kBlockN * static_cast<int>(sizeof(float));
-constexpr int kSmemBytes = kOperandSmemBytes + kScoresSmemBytes;
+// tile's scores are still being reduced. 36 KB at 128, 20 KB at 64.
+template <int kBlockN> constexpr int smem_bytes() {
+  return operand_smem_bytes<kBlockN>() + scores_smem_bytes<kBlockN>();
+}
 
-static_assert(kSmemBytes <= 48 * 1024, "bump cudaFuncSetAttribute before growing the tile");
-
-// kBlockN / 32 lanes, so each lane owns this many contiguous columns of one row.
-constexpr int kColsPerLane = kBlockN / 32;
+static_assert(smem_bytes<64>() <= 48 * 1024, "bump cudaFuncSetAttribute before growing the tile");
+static_assert(smem_bytes<128>() <= 48 * 1024, "bump cudaFuncSetAttribute before growing the tile");
 
 // The scores land in shared memory row-major so the reductions can walk a row contiguously. The
 // GEMM tiles are K-major for the same reason on their side: the copy atom moves 8 contiguous
 // halves, and both operands are K-contiguous in global memory.
+template <int kBlockN>
 __global__ __launch_bounds__(kThreads) void fused_softmax_recompute_device(
     const __half *__restrict__ dQ,
     int ldQ,
@@ -119,9 +129,19 @@ __global__ __launch_bounds__(kThreads) void fused_softmax_recompute_device(
   Tensor mA = make_tensor(make_gmem_ptr(query), make_shape(m, k), make_stride(ldQ, Int<1>{}));
   Tensor mB = make_tensor(make_gmem_ptr(key), make_shape(n, k), make_stride(ldK, Int<1>{}));
 
+  // Under a causal mask the last row blocks are the heaviest: they see every column, while the
+  // first block sees only its own 32. Blocks are dispatched in increasing blockIdx, so leaving the
+  // mapping alone starts the heaviest CTAs last and lets the shortest ones idle the SMs while the
+  // tail runs. Reversing it puts the heavy CTAs first, the classic longest-processing-time-first
+  // schedule, and needs no persistent grid to enforce it. Unmasked shapes have equal work in every
+  // block, so they keep the natural order (and its sequential Q reads). Both the Q tile below and
+  // the output rows have to follow this mapping, not blockIdx.
+  const auto rowBlock =
+      causal ? static_cast<int>(gridDim.x - 1 - blockIdx.x) : static_cast<int>(blockIdx.x);
+
   // Both the N and K coordinates stay residual, so one CTA walks the whole row in tiles instead of
   // owning it outright the way fused_softmax_regrow does.
-  const auto ctaCoord = make_coord(blockIdx.x, _, _);
+  const auto ctaCoord = make_coord(rowBlock, _, _);
   const Tensor gA = local_tile(mA, ctaTiler, ctaCoord, Step<_1, X, _1>{});
   const Tensor gB = local_tile(mB, ctaTiler, ctaCoord, Step<X, _1, _1>{});
 
@@ -156,7 +176,7 @@ __global__ __launch_bounds__(kThreads) void fused_softmax_recompute_device(
 
   // Cast once here rather than at each use: blockIdx.x is unsigned, and leaving it that way would
   // narrow to int at every use below.
-  const auto rowBase = static_cast<int>(blockIdx.x) * kBlockM;
+  const auto rowBase = rowBlock * kBlockM;
   const auto threadId = static_cast<int>(threadIdx.x);
 
   // Under a causal mask, the tile's last row sees no column past this one: column j is visible iff
@@ -178,7 +198,7 @@ __global__ __launch_bounds__(kThreads) void fused_softmax_recompute_device(
     compute_tile(tiledCopy, tiledMma, gA, sA, gB(_, _, nt, _), sB, tCrC, kTiles);
     store_scores(tCrC, tCcC, tCsScores, rowBase, nt * kBlockN, m, n, scale, causal);
     __syncthreads();
-    online_row_stats<kColsPerLane>(scoresPtr, sRowMax, sRowSum);
+    online_row_stats<kBlockN / 32>(scoresPtr, sRowMax, sRowSum);
     __syncthreads();
   }
 
@@ -189,7 +209,7 @@ __global__ __launch_bounds__(kThreads) void fused_softmax_recompute_device(
     compute_tile(tiledCopy, tiledMma, gA, sA, gB(_, _, nt, _), sB, tCrC, kTiles);
     store_scores(tCrC, tCcC, tCsScores, rowBase, nt * kBlockN, m, n, scale, causal);
     __syncthreads();
-    normalize_rows<kColsPerLane>(scoresPtr, dP, ldP, rowBase, nt * kBlockN, sRowMax, sRowSum);
+    normalize_rows<kBlockN / 32>(scoresPtr, dP, ldP, rowBase, nt * kBlockN, sRowMax, sRowSum);
     __syncthreads();
   }
 
@@ -197,6 +217,25 @@ __global__ __launch_bounds__(kThreads) void fused_softmax_recompute_device(
   for (auto nt = activeTiles; nt < nTiles; ++nt) {
     zero_tile<kBlockN>(dP, ldP, rowBase, nt * kBlockN);
   }
+}
+
+template <int kBlockN>
+void launch_recompute(
+    int m,
+    int n,
+    int k,
+    const __half *dQ,
+    int ldQ,
+    const __half *dK,
+    int ldK,
+    __half *dP,
+    int ldP,
+    float scale,
+    bool causal) {
+  const dim3 dimBlock(kThreads);
+  const dim3 dimGrid(m / kBlockM);
+  fused_softmax_recompute_device<kBlockN><<<dimGrid, dimBlock, smem_bytes<kBlockN>()>>>(
+      dQ, ldQ, dK, ldK, dP, ldP, m, n, k, scale, causal);
 }
 
 } // namespace
@@ -216,10 +255,10 @@ void fused_softmax_recompute(
   static_assert(sizeof(__half) == sizeof(half_t), "the casts above need these to match");
 
   // Unlike fused_softmax_regrow, n is a multiple rather than a fixed value: the columns are
-  // streamed in kBlockN-wide tiles, so the row never has to fit. There is no N tail, so n has to
-  // divide.
-  if (n % kBlockN != 0) {
-    throw runtime_error("fused_softmax_recompute needs n to be a multiple of 128");
+  // streamed in 64- or 128-wide tiles, so the row never has to fit. There is no N tail, so n has to
+  // divide. 64 is the common multiple, and the only one the narrow instantiation needs.
+  if (n % 64 != 0) {
+    throw runtime_error("fused_softmax_recompute needs n to be a multiple of 64");
   }
   if (m % kBlockM != 0) {
     throw runtime_error("fused_softmax_recompute needs m to be a multiple of 32");
@@ -232,10 +271,35 @@ void fused_softmax_recompute(
     throw runtime_error("fused_softmax_recompute needs ldP to be even");
   }
 
-  const dim3 dimBlock(kThreads);
-  const dim3 dimGrid(m / kBlockM);
-  fused_softmax_recompute_device<<<dimGrid, dimBlock, kSmemBytes>>>(
-      dQ, ldQ, dK, ldK, dP, ldP, m, n, k, scale, causal);
+  // How many CTAs of the 128-wide kernel one wave of the device holds. Measured once: it is the
+  // crossover the dispatch needs, and the answer depends on the device and on the kernel's
+  // registers and shared memory, not on anything a hardcoded threshold could know.
+  static const auto sWave128 = [] {
+    auto blocks = 2; // the shape this kernel was tuned around, if the query fails
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &blocks, fused_softmax_recompute_device<128>, kThreads, smem_bytes<128>()) !=
+        cudaSuccess) {
+      blocks = 2;
+    }
+    auto device = 0;
+    auto sms = 1;
+    cudaGetDevice(&device);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+    return blocks * sms;
+  }();
+
+  const auto rowBlocks = m / kBlockM;
+  // A grid that fits one 128-wide wave keeps the wider tile: fewer tiles per CTA, less per-tile
+  // overhead. Once it would spill into a second wave, the narrow tile's four CTAs per SM and half
+  // the tiles per CTA give a shorter makespan. A causal shape keeps 128 for a different reason:
+  // the row blocks are reversed so the heavy ones run first (see the kernel), which already hides
+  // the imbalance, and a causal CTA's work is not the full row anyway.
+  const auto useNarrow = n % 128 != 0 || (!causal && rowBlocks > sWave128);
+  if (useNarrow) {
+    launch_recompute<64>(m, n, k, dQ, ldQ, dK, ldK, dP, ldP, scale, causal);
+  } else {
+    launch_recompute<128>(m, n, k, dQ, ldQ, dK, ldK, dP, ldP, scale, causal);
+  }
   auto error = cudaDeviceSynchronize();
   if (error != cudaSuccess) {
     throw runtime_error(cudaGetErrorString(error));
