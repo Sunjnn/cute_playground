@@ -37,7 +37,7 @@ iterations) except where a table says otherwise.
   multiple of 64 and pays for it with 2x the GEMM multiply-adds instead of
   extra traffic. The global-to-shared copies are `cp.async`, one commit group
   per K tile and one wait before the read; that is worth 7–18% on the shapes
-  with the fewest CTAs, where the copy would otherwise be exposed. Four
+  with the fewest CTAs, where the copy would otherwise be exposed. Five
   scheduling choices matter as much as the arithmetic:
   - **Causal row order.** Under a causal mask the last row blocks see every
     column and the first block sees only its own 32, so the row blocks have
@@ -63,6 +63,12 @@ iterations) except where a table says otherwise.
     build drops from 4 CTAs per SM to 3 and the 128-wide from 2 to 1, and the
     large shapes regressed (16384 x 2048: 868 -> 964 µs). The parameter stays
     so the trade can be retried when the tile changes.
+  - **Last-tile reuse.** Pass 1 leaves its last active tile's scores in shared
+    memory, and the row statistics are final by then, so pass 2 normalizes that
+    tile in place instead of recomputing it. One GEMM and one copy per CTA are
+    saved: a third of the second pass at `n = 256`, and all of it at `n = 128`
+    (4096 x 128 x 128: 36.5 -> 28.3 µs). At large `n` it converges to the
+    1/nTiles share (3% at 1024 x 8192).
 - **`fused_softmax_naive` — this repo's correctness floor.** One row per CTA,
   256 threads, plain SIMT multiply-add (no tensor cores), the row's scores
   staged in shared memory and walked three times: max, exponentiate-and-sum,
@@ -108,95 +114,95 @@ Each table is the median of **seven full passes**, each pass itself the mean of
 20 timed iterations after 3 warm-up iterations. A first full pass was run and
 discarded as GPU clock warm-up. Pass-to-pass spread after warm-up is under ~12%
 at most shapes; on the shortest shapes (20–80 µs) isolated samples deviate by
-20–50% and occasionally more (one 1024 x 2048 cuBLAS sample ran at 71 µs
-against a 46 µs median, and one 1024 x 512, `k = 512` regrow sample at 112 µs
-against a 62 µs median), which is why the tables report medians — this is a
-shared desktop GPU. `—` means the implementation does not accept that shape.
-The ratio columns are `cublas time / implementation time`, so **above 1.00x
-means the in-repo kernel is faster than the baseline**.
+20–50% and occasionally more (one 1024 x 2048 cuBLAS sample ran at 105 µs
+against a 47 µs median, and one 2048 x 2048, `k = 64` recompute sample at
+295 µs against a 123 µs median), which is why the tables report medians — this
+is a shared desktop GPU. `—` means the implementation does not accept that
+shape. The ratio columns are `cublas time / implementation time`, so **above
+1.00x means the in-repo kernel is faster than the baseline**.
 
 **Square, causal mask, `k = 128` (µs):**
 
 | shape | naive | cublas (baseline) | regrow | recompute | naive / cublas | regrow / cublas | recompute / cublas |
 |---|---|---|---|---|---|---|---|
-| 256 × 256 | 73.5 | 32.2 | 21.7 | 20.7 | 0.44x | 1.48x | 1.56x |
-| 512 × 512 | 227.6 | 33.9 | 22.0 | 30.9 | 0.15x | 1.54x | 1.10x |
-| 1024 × 1024 | 862.6 | 46.0 | — | 52.5 | 0.05x | — | 0.88x |
-| 2048 × 2048 | 3897.4 | 80.0 | — | 107.2 | 0.02x | — | 0.75x |
-| 4096 × 4096 | 15815.2 | 440.1 | — | 240.9 | 0.03x | — | 1.83x |
-| 8192 × 8192 | 59292.0 | 1733.3 | — | 931.2 | 0.03x | — | 1.86x |
+| 256 × 256 | 73.6 | 32.4 | 17.5 | 18.7 | 0.44x | 1.85x | 1.73x |
+| 512 × 512 | 227.8 | 34.5 | 21.1 | 33.1 | 0.15x | 1.64x | 1.04x |
+| 1024 × 1024 | 848.5 | 45.5 | — | 48.6 | 0.05x | — | 0.94x |
+| 2048 × 2048 | 3881.7 | 80.6 | — | 96.9 | 0.02x | — | 0.83x |
+| 4096 × 4096 | 15745.4 | 435.8 | — | 236.4 | 0.03x | — | 1.84x |
+| 8192 × 8192 | 58868.5 | 1723.3 | — | 927.3 | 0.03x | — | 1.86x |
 
 **Rows, `n = 2048`, `k = 128`, no mask (µs):**
 
 | shape | naive | cublas (baseline) | regrow | recompute | naive / cublas | regrow / cublas | recompute / cublas |
 |---|---|---|---|---|---|---|---|
-| 256 × 2048 | 1004.6 | 36.5 | — | 88.3 | 0.04x | — | 0.41x |
-| 512 × 2048 | 1987.0 | 45.6 | — | 87.5 | 0.02x | — | 0.52x |
-| 1024 × 2048 | 3949.2 | 48.8 | — | 107.8 | 0.01x | — | 0.45x |
-| 2048 × 2048 | 7826.9 | 81.2 | — | 162.6 | 0.01x | — | 0.50x |
-| 4096 × 2048 | 15670.0 | 205.1 | — | 293.0 | 0.01x | — | 0.70x |
-| 8192 × 2048 | 31511.1 | 448.3 | — | 479.3 | 0.01x | — | 0.94x |
-| 16384 × 2048 | 62745.1 | 901.0 | — | 879.0 | 0.01x | — | 1.03x |
+| 256 × 2048 | 1009.4 | 36.9 | — | 86.4 | 0.04x | — | 0.43x |
+| 512 × 2048 | 1981.1 | 45.3 | — | 87.0 | 0.02x | — | 0.52x |
+| 1024 × 2048 | 3953.1 | 47.1 | — | 105.0 | 0.01x | — | 0.45x |
+| 2048 × 2048 | 7817.2 | 84.9 | — | 167.7 | 0.01x | — | 0.51x |
+| 4096 × 2048 | 15624.2 | 207.3 | — | 285.3 | 0.01x | — | 0.73x |
+| 8192 × 2048 | 31336.8 | 447.2 | — | 468.7 | 0.01x | — | 0.95x |
+| 16384 × 2048 | 62692.6 | 894.3 | — | 859.5 | 0.01x | — | 1.04x |
 
 **Columns, `m = 1024`, `k = 128`, no mask (µs):**
 
 | shape | naive | cublas (baseline) | regrow | recompute | naive / cublas | regrow / cublas | recompute / cublas |
 |---|---|---|---|---|---|---|---|
-| 1024 × 256 | 423.0 | 34.5 | 17.9 | 24.0 | 0.08x | 1.93x | 1.44x |
-| 1024 × 512 | 850.4 | 38.1 | 35.1 | 34.5 | 0.04x | 1.09x | 1.10x |
-| 1024 × 1024 | 1696.3 | 45.4 | — | 58.4 | 0.03x | — | 0.78x |
-| 1024 × 2048 | 3938.7 | 47.2 | — | 112.0 | 0.01x | — | 0.42x |
-| 1024 × 4096 | 7950.5 | 81.9 | — | 201.8 | 0.01x | — | 0.41x |
-| 1024 × 8192 | 14937.2 | 209.4 | — | 393.3 | 0.01x | — | 0.53x |
+| 1024 × 256 | 423.2 | 34.4 | 17.7 | 21.9 | 0.08x | 1.94x | 1.57x |
+| 1024 × 512 | 844.0 | 38.9 | 36.3 | 32.2 | 0.05x | 1.07x | 1.21x |
+| 1024 × 1024 | 1683.3 | 44.9 | — | 56.1 | 0.03x | — | 0.80x |
+| 1024 × 2048 | 3917.8 | 55.7 | — | 104.8 | 0.01x | — | 0.53x |
+| 1024 × 4096 | 7929.9 | 82.5 | — | 195.5 | 0.01x | — | 0.42x |
+| 1024 × 8192 | 14906.6 | 207.6 | — | 380.4 | 0.01x | — | 0.55x |
 
 **Head dim, 2048 × 2048, no mask (µs):**
 
 | shape | naive | cublas (baseline) | regrow | recompute | naive / cublas | regrow / cublas | recompute / cublas |
 |---|---|---|---|---|---|---|---|
-| 2048 × 2048, k = 64 | 4012.6 | 87.5 | — | 122.9 | 0.02x | — | 0.71x |
-| 2048 × 2048, k = 128 | 7863.7 | 79.8 | — | 163.5 | 0.01x | — | 0.49x |
-| 2048 × 2048, k = 256 | 16009.1 | 96.8 | — | 271.6 | 0.01x | — | 0.36x |
-| 2048 × 2048, k = 512 | 32472.3 | 163.6 | — | 483.8 | 0.01x | — | 0.34x |
+| 2048 × 2048, k = 64 | 3908.8 | 98.0 | — | 124.8 | 0.03x | — | 0.79x |
+| 2048 × 2048, k = 128 | 7825.3 | 80.3 | — | 167.0 | 0.01x | — | 0.48x |
+| 2048 × 2048, k = 256 | 16089.2 | 96.0 | — | 265.2 | 0.01x | — | 0.36x |
+| 2048 × 2048, k = 512 | 32413.4 | 155.7 | — | 462.2 | 0.00x | — | 0.34x |
 
 **Regrow's 256-wide row, `n = 256`, `k = 128`, no mask (µs):**
 
 | shape | naive | cublas (baseline) | regrow | recompute | naive / cublas | regrow / cublas | recompute / cublas |
 |---|---|---|---|---|---|---|---|
-| 256 × 256 | 117.2 | 32.1 | 17.7 | 20.7 | 0.27x | 1.81x | 1.55x |
-| 1024 × 256 | 423.0 | 34.5 | 18.0 | 24.0 | 0.08x | 1.92x | 1.44x |
-| 4096 × 256 | 1649.4 | 55.8 | 31.0 | 46.5 | 0.03x | 1.80x | 1.20x |
-| 16384 × 256 | 6481.3 | 108.8 | 61.0 | 117.6 | 0.02x | 1.78x | 0.93x |
+| 256 × 256 | 117.1 | 32.2 | 20.1 | 18.7 | 0.27x | 1.60x | 1.72x |
+| 1024 × 256 | 423.1 | 34.2 | 18.1 | 22.3 | 0.08x | 1.89x | 1.53x |
+| 4096 × 256 | 1618.7 | 55.5 | 35.2 | 42.5 | 0.03x | 1.58x | 1.31x |
+| 16384 × 256 | 6459.6 | 109.3 | 63.5 | 107.7 | 0.02x | 1.72x | 1.01x |
 
 **Regrow's 256-wide row, `m = 4096`, `n = 256`, no mask (µs):**
 
 | shape | naive | cublas (baseline) | regrow | recompute | naive / cublas | regrow / cublas | recompute / cublas |
 |---|---|---|---|---|---|---|---|
-| 4096 × 256, k = 64 | 828.8 | 49.1 | 26.9 | 36.3 | 0.06x | 1.83x | 1.35x |
-| 4096 × 256, k = 128 | 1624.7 | 55.1 | 34.4 | 46.5 | 0.03x | 1.60x | 1.18x |
-| 4096 × 256, k = 256 | 3266.2 | 69.2 | 46.2 | 68.0 | 0.02x | 1.50x | 1.02x |
-| 4096 × 256, k = 512 | 6589.3 | 65.6 | 53.2 | 107.8 | 0.01x | 1.23x | 0.61x |
+| 4096 × 256, k = 64 | 824.7 | 49.3 | 23.3 | 34.1 | 0.06x | 2.12x | 1.45x |
+| 4096 × 256, k = 128 | 1634.3 | 55.1 | 32.0 | 42.5 | 0.03x | 1.72x | 1.30x |
+| 4096 × 256, k = 256 | 3239.2 | 58.6 | 47.2 | 66.5 | 0.02x | 1.24x | 0.88x |
+| 4096 × 256, k = 512 | 6579.9 | 65.8 | 53.9 | 94.0 | 0.01x | 1.22x | 0.70x |
 
 **Regrow's 512-wide row, `n = 512`, `k = 128`, no mask (µs):**
 
 | shape | naive | cublas (baseline) | regrow | recompute | naive / cublas | regrow / cublas | recompute / cublas |
 |---|---|---|---|---|---|---|---|
-| 256 × 512 | 226.4 | 31.3 | 21.8 | 36.4 | 0.14x | 1.44x | 0.86x |
-| 1024 × 512 | 843.3 | 38.0 | 42.5 | 34.3 | 0.05x | 0.89x | 1.11x |
-| 4096 × 512 | 3269.1 | 56.1 | 56.8 | 81.4 | 0.02x | 0.99x | 0.69x |
-| 16384 × 512 | 13042.5 | 241.1 | 178.7 | 226.1 | 0.02x | 1.35x | 1.07x |
+| 256 × 512 | 225.6 | 32.5 | 21.3 | 34.5 | 0.14x | 1.53x | 0.94x |
+| 1024 × 512 | 855.5 | 38.5 | 33.0 | 32.1 | 0.05x | 1.17x | 1.20x |
+| 4096 × 512 | 3284.0 | 56.2 | 56.9 | 77.6 | 0.02x | 0.99x | 0.72x |
+| 16384 × 512 | 13074.8 | 241.9 | 178.7 | 214.6 | 0.02x | 1.35x | 1.13x |
 
 **Regrow's 512-wide row, `m = 1024`, `n = 512`, no mask (µs):**
 
 | shape | naive | cublas (baseline) | regrow | recompute | naive / cublas | regrow / cublas | recompute / cublas |
 |---|---|---|---|---|---|---|---|
-| 1024 × 512, k = 64 | 424.9 | 37.5 | 23.3 | 27.1 | 0.09x | 1.61x | 1.38x |
-| 1024 × 512, k = 128 | 849.5 | 37.9 | 35.3 | 34.3 | 0.04x | 1.07x | 1.10x |
-| 1024 × 512, k = 256 | 1683.0 | 41.9 | 39.3 | 52.5 | 0.02x | 1.07x | 0.80x |
-| 1024 × 512, k = 512 | 3380.7 | 50.9 | 62.5 | 88.0 | 0.02x | 0.81x | 0.58x |
+| 1024 × 512, k = 64 | 425.5 | 37.6 | 23.5 | 28.4 | 0.09x | 1.60x | 1.32x |
+| 1024 × 512, k = 128 | 843.0 | 38.2 | 35.8 | 32.2 | 0.05x | 1.07x | 1.19x |
+| 1024 × 512, k = 256 | 1702.8 | 42.1 | 39.2 | 47.6 | 0.02x | 1.07x | 0.88x |
+| 1024 × 512, k = 512 | 3378.0 | 56.1 | 61.4 | 84.5 | 0.02x | 0.91x | 0.66x |
 
 `n = 128` has no baseline: `cublas_unfused_softmax` needs `n >= 256` to fill a
-row's register cache. At 4096 x 128 x 128, `regrow` runs in 19.6 µs against
-`recompute`'s 31.9 µs and `naive`'s 830.7 µs.
+row's register cache. At 4096 x 128 x 128, `regrow` runs in 20.1 µs against
+`recompute`'s 28.3 µs and `naive`'s 829.6 µs.
 
 ## Reading the numbers
 
@@ -204,30 +210,30 @@ row's register cache. At 4096 x 128 x 128, `regrow` runs in 19.6 µs against
 work (see the earlier revisions of this file), the baseline won everything
 except `regrow` at its narrowest widths. Now:
 
-- `fused_softmax_regrow` wins at every width it supports: 1.23–1.92x at
-  `n = 256`, and 0.81–1.61x at `n = 512`. The low end is the deep-K narrow
-  GEMM (`n = 512, k = 512`: 0.81x) plus one noisy 1024 x 512 entry (0.89x,
-  where other passes measured ~1.05x); the 16384 x 512 case is a 1.35x win.
+- `fused_softmax_regrow` wins at every width it supports: 1.22–2.12x at
+  `n = 256`, and 0.91–1.60x at `n = 512`. The low end is the deep-K narrow
+  GEMM (`n = 512, k = 512`: 0.91x) and a tie at 4096 x 512 (0.99x); the
+  16384 x 512 case is a 1.35x win.
 - `fused_softmax_recompute` wins the causal squares at the ends of the range —
-  1.56x at 256 x 256, 1.83x at 4096 x 4096, 1.86x at 8192 x 8192 — and loses
-  narrowly in the middle (0.88x at 1024 x 1024, 0.75x at 2048 x 2048), where
-  the baseline's score buffer still fits L2 and the row-block schedule has
-  little room to help. It is also a 1.10x win at 512 x 512.
-- On no-mask shapes it still loses while the second GEMM dominates: 0.41–0.70x
-  across the rows sweep up to `m = 4096` and 0.41–0.78x across the columns
-  sweep from `n = 1024` on, recovering to 0.94x/1.03x at 8192/16384 rows. The
-  narrow columns are the exception: `n = 256`/`512` are 1.44x/1.10x wins, the
+  1.73x at 256 x 256, 1.84x at 4096 x 4096, 1.86x at 8192 x 8192 — is a 1.04x
+  win at 512 x 512, and loses narrowly in the middle (0.94x at 1024 x 1024,
+  0.83x at 2048 x 2048), where the baseline's score buffer still fits L2 and
+  the row-block schedule has little room to help.
+- On no-mask shapes it still loses while the second GEMM dominates: 0.43–0.73x
+  across the rows sweep up to `m = 4096` and 0.42–0.80x across the columns
+  sweep from `n = 1024` on, recovering to 0.95x/1.04x at 8192/16384 rows. The
+  narrow columns are the exception: `n = 256`/`512` are 1.57x/1.21x wins, the
   cp.async copy and small score buffer doing the work. Head dims at 2048 x 2048
-  are 0.34–0.71x.
+  are 0.34–0.79x.
 - `fused_softmax_naive` remains the floor: 2.3x slower than the baseline at
-  256 x 256, 19x at 1024 x 1024, 33–96x at the larger shapes (about 200x at
+  256 x 256, 19x at 1024 x 1024, 33–92x at the larger shapes (about 200x at
   `k = 512`).
 
 For scale, the same shapes measured before this round of work: `recompute` at
-2048 x 2048 causal went 339.0 -> 107.2 µs (3.2x), at 4096 x 4096 causal
-1068.8 -> 240.9 µs (4.4x), at 2048 x 2048 no mask 338.8 -> 162.6 µs (2.1x);
-`regrow` at 16384 x 256 went 108.2 -> 61.0 µs (1.8x) and at 4096 x 256, `k = 512`
-went 103.5 -> 53.2 µs (1.9x). The pieces, measured as they landed:
+2048 x 2048 causal went 339.0 -> 96.9 µs (3.5x), at 4096 x 4096 causal
+1068.8 -> 236.4 µs (4.5x), at 2048 x 2048 no mask 338.8 -> 167.7 µs (2.0x);
+`regrow` at 16384 x 256 went 108.2 -> 63.5 µs (1.7x) and at 4096 x 256, `k = 512`
+went 103.5 -> 53.9 µs (1.9x). The pieces, measured as they landed:
 
 - **`ldmatrix` + swizzle** (first round): roughly halved the fused GEMM's time
   and is most of the no-mask improvement.
@@ -235,44 +241,49 @@ went 103.5 -> 53.2 µs (1.9x). The pieces, measured as they landed:
   and 8192 x 8192 causal 1137 -> 1024 µs (1.11x); nothing when the grid fits
   one wave (≤1024 x 1024).
 - **Adaptive 64/128 tile width**: 2048 x 2048 no mask 212 -> 162 µs (1.31x),
-  16384 x 2048 963 -> 868 µs (and now a 1.03x win); it also makes 8192 x 2048
-  a 0.94x near-tie instead of 0.83x.
-- **cp.async copy** (this round): 4096 x 4096 causal 263.2 -> 240.9 µs,
-  8192 x 8192 causal 1024 -> 931 µs, 1024 x 8192 465 -> 393 µs,
-  1024 x 4096 232 -> 202 µs, 1024 x 2048 121 -> 112 µs. The two-stage ring
-  was measured and turned down: at kStages = 2 the 64-wide build lost its
-  fourth CTA per SM and 16384 x 2048 regressed 868 -> 964 µs.
+  16384 x 2048 963 -> 868 µs (and now a 1.04x win); it also makes 8192 x 2048
+  a 0.95x near-tie instead of 0.83x.
+- **cp.async copy + last-tile reuse** (this round): 4096 x 4096 causal
+  263.2 -> 236.4 µs, 8192 x 8192 causal 1024 -> 927 µs, 1024 x 8192
+  465 -> 380 µs, 1024 x 4096 232 -> 196 µs, 1024 x 2048 121 -> 105 µs. The
+  two-stage ring was measured and turned down: at kStages = 2 the 64-wide build
+  lost its fourth CTA per SM and 16384 x 2048 regressed 868 -> 964 µs.
+- **Last-tile reuse** alone is 20% at `n = 128` (4096 x 128 x 128: 33.8 ->
+  26.9 µs, the entire second GEMM), 6–10% at `n = 256/512` (1024 x 256:
+  23.4 -> 21.9, 1024 x 512: 34.5 -> 32.2), and ~4% on the causal squares
+  (2048 x 2048: 107 -> 97); at 64 tiles it is the 1/64 share.
 
 **Where the speed comes from now.** The fused GEMM is no longer the weak link.
 Measured as `2·M·N·K / time`, with both `recompute` passes attributed to the
 GEMM (and its causal skip counted as the ~half of the flops it really runs), it
-reaches **13.2 TFLOP/s** at 2048 x 2048 no mask against the baseline's 13.2,
-**19.5** at 16384 x 2048 against 9.5, **17.8** at 4096 x 4096 causal against
-9.8, **18.4** at 8192 x 8192 causal against 9.9, and **17.6** in `regrow` at
-16384 x 256 against 9.9. The baseline's 9.5–9.9 TFLOP/s at the large shapes is
-its whole pipeline, score round trip included; there it is moving 366–425 GB/s
-of nominal traffic (82–95% of the card's 448 GB/s) and is DRAM-bound, while the
+reaches **12.8 TFLOP/s** at 2048 x 2048 no mask against the baseline's 12.7,
+**20.0** at 16384 x 2048 against 9.6, **18.2** at 4096 x 4096 causal against
+9.9, **18.5** at 8192 x 8192 causal against 10.0, and **16.9** in `regrow` at
+16384 x 256 against 9.8. The baseline's 8.9–10.0 TFLOP/s at the large shapes is
+its whole pipeline, score round trip included; there it is moving 365–423 GB/s
+of nominal traffic (81–94% of the card's 448 GB/s) and is DRAM-bound, while the
 fused kernels are still compute-bound. The remaining losses are structural:
 
 - **`recompute` pays for its second GEMM.** At 2048 x 2048 no mask its per-pass
-  rate matches the baseline's whole pipeline (13.2 vs 13.2), so the 2x passes
-  alone explain the 0.50x. At 16384 x 2048 the per-pass rate is 2.1x the
-  baseline's and the total wins 1.03x despite the second pass. The crossover is
+  rate matches the baseline's whole pipeline (12.8 vs 12.7), so the 2x passes
+  alone explain the 0.51x. At 16384 x 2048 the per-pass rate is 2.1x the
+  baseline's and the total wins 1.04x despite the second pass. The crossover is
   when the fused GEMM's per-flop advantage outruns 2x.
 - **The causal schedule is worth a fifth of the GEMM at large sizes.** The LPT
   row order took 4096 x 4096 causal from 327.9 to 263.2 µs (1.25x) and
-  8192 x 8192 causal from 1137 to 1024 µs (1.11x), before the cp.async copy
-  took those to 240.9 and 931 µs. It does nothing when the whole grid fits one
-  wave, which is exactly where the imbalance has nowhere to hide.
+  8192 x 8192 causal from 1137 to 1024 µs (1.11x), before the cp.async copy and
+  last-tile reuse took those to 236.4 and 927 µs. It does nothing when the
+  whole grid fits one wave, which is exactly where the imbalance has nowhere to
+  hide.
 - **The 64-wide dispatch is worth a quarter at large `m`.** 2048 x 2048 no mask
   went 212 -> 162 µs (1.31x), 16384 x 2048 963 -> 868 µs, and 2048 x 2048 at
-  `k = 512` 530 -> 484 µs. It costs nothing when the grid fits one wave, which
+  `k = 512` 530 -> 462 µs. It costs nothing when the grid fits one wave, which
   is why the host measures the wave rather than guessing from `m`.
 - **`regrow`'s wider rows cost occupancy.** 128 and 256 wide run 4 and 2 CTAs
   per SM; 512 needs 68 KB and runs 1. Its per-GEMM efficiency therefore depends
   on the problem being large enough to keep that one CTA busy. At 16384 x 512 it
   wins 1.35x: the baseline's fp32 score buffer is 33.5 MB there, well past the
-  24 MB L2, so its 5x traffic is real DRAM work (88 MB in 241 µs, 366 GB/s),
+  24 MB L2, so its 5x traffic is real DRAM work (88 MB in 242 µs, 365 GB/s),
   while the fused kernel writes P once and stays compute-bound. At 4096 x 512
   the baseline's buffer (8.4 MB) is back in L2 and the two tie; at `k = 512` the
   GEMM dominates and the extra CTA matters more than the saved traffic.
@@ -299,7 +310,7 @@ approached: 4.9e-4 at `n <= 2048`, 5.3e-4 at `n = 4096`, and 1.2e-3 at
 - **Shared desktop GPU.** Passes after the discarded warm-up still show
   occasional 20–50% single-sample spikes on the 20–80 µs shapes, from desktop
   memory bursts and GDDR7 power-state changes; the 1024 x 2048 cuBLAS and
-  1024 x 512, `k = 512` regrow samples quoted above are the worst of this
+  2048 x 2048, `k = 64` recompute samples quoted above are the worst of this
   session. The medians are stable; individual samples are not. This is the same
   environment documented in `examples/softmax`.
 - **No hardware counters.** Nsight Compute could not attach in this session
@@ -352,8 +363,9 @@ host; it is O(m·n·k) and is the slow part of the harness at large shapes (the
 - **Attack the epilogue.** With the GEMM fast, the per-tile score staging and
   the two reductions dominate at small `k` (the k = 64 row of the head-dim table
   is the clearest case). Computing pass 1's (max, sum) directly from the
-  accumulator fragment would remove a 16 KB shared-memory round trip and two
-  barriers per tile; the reads are already `LDS.128`, so the win is removing the
+  accumulator fragment would remove the 16 KB score staging and the warp-per-row
+  read from pass 1 entirely; last-tile reuse means only the final tile still
+  needs to be staged. The reads are already `LDS.128`, so the win is removing the
   staging, not changing its access pattern.
 - **Widen the shapes.** The kernels still throw on `m % 32 != 0` and
   `k % 64 != 0`; attention head dims such as 96 or ragged sequence lengths need

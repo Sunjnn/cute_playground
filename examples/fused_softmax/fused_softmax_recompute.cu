@@ -71,6 +71,7 @@ namespace {
 // free. At K = 128 that needs B > 256, which is roughly where a consumer Blackwell's fp16 tensor
 // throughput against its 448 GB/s of DRAM lands - close enough that the README measures it rather
 // than asserting it.
+
 // Column tile width. The kernel is instantiated at 128 and 64:
 //   - 128 halves the per-tile overhead (barriers, score staging) and fits two CTAs per SM;
 //   - 64 halves the tile count per CTA and fits four, which wins exactly when the 128-wide grid
@@ -94,7 +95,7 @@ template <int kBlockN> constexpr int scores_smem_bytes() {
 // residency at each width (64: 4 -> 3, 128: 2 -> 1), which cost more at the large shapes than the
 // overlap bought; the parameter stays so the trade can be retried when the tile changes. What did
 // pay is the cp.async copy itself, with one commit group per tile and a wait before the read: it
-// removed the synchronous load/store chain and is worth 9-16% on the 128-wide shapes with fewer
+// removed the synchronous load/store chain and is worth 7-18% on the 128-wide shapes with fewer
 // CTAs (1024 x 2048, 1024 x 8192, and the causal squares).
 template <int kBlockN, int kStages> constexpr int smem_bytes() {
   return kStages * operand_smem_bytes<kBlockN>() + scores_smem_bytes<kBlockN>();
@@ -214,14 +215,19 @@ __global__ __launch_bounds__(kThreads) void fused_softmax_recompute_device(
     __syncthreads();
   }
 
-  // Pass 2: recompute and write, now that every row's final statistics are known. Masked columns
-  // come back as -INFINITY from store_scores and leave as exactly 0, so this pass needs no mask
-  // logic of its own.
-  for (auto nt = 0; nt < activeTiles; ++nt) {
-    compute_tile_async<kStages>(tiledCopy, tiledMma, gA, sA, gB(_, _, nt, _), sB, tCrC, kTiles);
-    store_scores(tCrC, tCcC, tCsScores, rowBase, nt * kBlockN, m, n, scale, causal);
+  // Pass 2: write, now that every row's final statistics are known. The last active tile is still
+  // in shared memory from pass 1 - online_row_stats only read it - so it is normalized in place
+  // instead of being recomputed, and is consumed before the loop below stores anything. That saves
+  // one GEMM and one copy per CTA: a sixth of the second pass at n = 256 (two tiles) and all of it
+  // at n = 128 (one tile).
+  normalize_rows<kBlockN / 32>(
+      scoresPtr, dP, ldP, rowBase, (activeTiles - 1) * kBlockN, sRowMax, sRowSum);
+  __syncthreads();
+  for (auto tile = 0; tile + 1 < activeTiles; ++tile) {
+    compute_tile_async<kStages>(tiledCopy, tiledMma, gA, sA, gB(_, _, tile, _), sB, tCrC, kTiles);
+    store_scores(tCrC, tCcC, tCsScores, rowBase, tile * kBlockN, m, n, scale, causal);
     __syncthreads();
-    normalize_rows<kBlockN / 32>(scoresPtr, dP, ldP, rowBase, nt * kBlockN, sRowMax, sRowSum);
+    normalize_rows<kBlockN / 32>(scoresPtr, dP, ldP, rowBase, tile * kBlockN, sRowMax, sRowSum);
     __syncthreads();
   }
 
