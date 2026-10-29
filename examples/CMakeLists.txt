@@ -36,6 +36,11 @@ foreach(dir ${example_dirs})
   # directory returns early above.
   target_link_libraries(
     ${dir} PRIVATE cutlass::cute playground::cudnn playground::cutensor CUDA::cublas)
+  # FA2 brings its own pinned CUTLASS and Torch ABI privately; only this example
+  # consumes the facade (or its unavailable-stub definition when disabled).
+  if(dir STREQUAL "flash_attention")
+    target_link_libraries(${dir} PRIVATE playground::flash_attention_upstream)
+  endif()
   target_include_directories(${dir} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/${dir})
   target_compile_options(
     ${dir} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr

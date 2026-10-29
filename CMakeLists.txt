@@ -69,6 +69,7 @@ endif()
 include(Cutlass)
 include(Cudnn)
 include(Cutensor)
+include(FlashAttention)
 
 option(BUILD_EXAMPLES "Build CuTe learning examples" ON)
 

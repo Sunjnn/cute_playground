@@ -65,6 +65,7 @@ fi
 
 find examples \
     -type f \( -name "*.cpp" -o -name "*.cu" \) \
+    -not -path "examples/flash_attention/upstream/*" \
     -exec clang-tidy -p "$db_dir" "${EXTRA_ARGS[@]}" {} +
 
 echo "clang-tidy done."
