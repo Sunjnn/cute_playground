@@ -54,6 +54,11 @@ using std::runtime_error;
 namespace {
 
 constexpr int kBlockN = 64;
+// Eight halves of padding on the P and V rows. Both are read by 16-byte row slices (P by the
+// generic PV copy, V by ldmatrix.trans); without the pad consecutive rows are a multiple of the
+// 32-bank stride apart and every slice of a warp lands on the same banks. A pad of 8 halves moves
+// each row by four banks, so eight rows cover all 32 banks exactly once.
+constexpr int kPad = 8;
 
 // No score staging: the QK accumulator stays in registers and the online softmax reduces it there
 // (see the loop). Q is staged once for the CTA; K and V are single buffers overwritten by the next
@@ -63,8 +68,8 @@ template <int kHeadDim> constexpr std::size_t smem_bytes() {
   constexpr std::size_t kKTiles = kHeadDim / kBlockK;
   return ((static_cast<std::size_t>(kBlockM) * kBlockK * kKTiles) +
           (static_cast<std::size_t>(kBlockN) * kBlockK * kKTiles) +
-          static_cast<std::size_t>(kBlockM) * kBlockN +
-          static_cast<std::size_t>(kBlockN) * kHeadDim) *
+          static_cast<std::size_t>(kBlockM) * (kBlockN + kPad) +
+          static_cast<std::size_t>(kBlockN) * (kHeadDim + kPad)) *
          sizeof(half_t);
 }
 
@@ -121,18 +126,20 @@ __global__ __launch_bounds__(kThreads) void flash_attention_device(
   auto *sQPtr = reinterpret_cast<half_t *>(sRaw);
   auto *sKPtr = sQPtr + static_cast<std::size_t>(kBlockM) * kBlockK * kKTiles;
   auto *sPPtr = sKPtr + static_cast<std::size_t>(kBlockN) * kBlockK * kKTiles;
-  auto *sVPtr = sPPtr + static_cast<std::size_t>(kBlockM) * kBlockN;
+  auto *sVPtr = sPPtr + static_cast<std::size_t>(kBlockM) * (kBlockN + kPad);
   const Tensor sQ = make_tensor(make_smem_ptr(sQPtr), make_k_major_smem_layout<kKTiles>(bM, bK));
   const Tensor sK = make_tensor(make_smem_ptr(sKPtr), make_k_major_smem_layout<kKTiles>(bN, bK));
-  const Tensor sP =
-      make_tensor(make_smem_ptr(sPPtr), make_layout(make_shape(bM, bN), make_stride(bN, _1{})));
-  const Tensor sV =
-      make_tensor(make_smem_ptr(sVPtr), make_layout(make_shape(bN, bD), make_stride(bD, _1{})));
+  const Tensor sP = make_tensor(make_smem_ptr(sPPtr),
+                                make_layout(make_shape(bM, bN), make_stride(bN + kPad, _1{})));
+  const Tensor sV = make_tensor(make_smem_ptr(sVPtr),
+                                make_layout(make_shape(bN, bD), make_stride(bD + kPad, _1{})));
   // MMA expresses C(M,N) = A(M,K) B(N,K)^T. For PV its reduction K is the key axis:
   // B(feature,key) must be V(key,feature), a transpose VIEW of the actual row-major V staging.
-  // V is deliberately unswizzled here, so stride (1, kHeadDim) is precisely that transpose.
-  const Tensor sVt =
-      make_tensor(make_smem_ptr(sVPtr), make_layout(make_shape(bD, bN), make_stride(_1{}, bD)));
+  // V is deliberately unswizzled here, so stride (1, kHeadDim + kPad) is precisely that transpose;
+  // the pad is what keeps ldmatrix.trans's row slices off a single bank per warp.
+  const Tensor sVt = make_tensor(
+      make_smem_ptr(sVPtr),
+      make_layout(make_shape(bD, bN), make_stride(_1{}, Int<kHeadDim + kPad>{})));
 
   // cp.async, not UniversalCopy: the key/value prefetches issued between phases only overlap if
   // the copy does not block the issuing warp.
@@ -326,7 +333,8 @@ __global__ __launch_bounds__(kThreads) void flash_attention_device(
         sumB += p0 + p1;
       }
       // The two elements of an MMA atom are adjacent columns of one row.
-      *reinterpret_cast<__half2 *>(sPPtr + row * kBlockN + col) = __floats2half2_rn(p0, p1);
+      *reinterpret_cast<__half2 *>(sPPtr + row * (kBlockN + kPad) + col) =
+          __floats2half2_rn(p0, p1);
     }
 #pragma unroll
     for (auto offset = 1; offset < 4; offset *= 2) {

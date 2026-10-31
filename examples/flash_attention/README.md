@@ -106,9 +106,12 @@ Q is staged once per CTA because its head dimension is invariant across key
 tiles; K and V are single buffers, and P is a third. A `cp.async` prefetch
 refills K and V for tile `t + 1` immediately after tile `t` has consumed them, so
 the transfer overlaps the softmax and PV in between. There is no multi-stage ring
-and no buffer aliasing. Dynamic shared memory is 24 KiB at `k=64` and 44 KiB at
-`k=128`, plus 384 bytes of row statistics and 1 KiB of per-tile reduction
-partials.
+and no buffer aliasing. Dynamic shared memory is 25.5 KiB at `k=64` and 45.5 KiB
+at `k=128`, plus 384 bytes of row statistics and 1 KiB of per-tile reduction
+partials. The P and V rows carry eight halves of padding: both are read as
+16-byte row slices (a generic copy for P, `ldmatrix.trans` for V), and without
+the pad every slice of a warp starts on the same bank, which measured as a
+32-way conflict.
 
 Both matrix multiplications and the online statistics/output numerator use
 FP32 accumulation. The fused kernel casts **unnormalized** p to fp16 for PV but
