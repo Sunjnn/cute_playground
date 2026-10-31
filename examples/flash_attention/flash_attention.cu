@@ -89,7 +89,6 @@ __global__ __launch_bounds__(kThreads) void flash_attention_device(
   extern __shared__ __align__(16) char sRaw[];
   __shared__ float sRowMax[kBlockM];
   __shared__ float sRowSum[kBlockM];
-  __shared__ float sRowScale[kBlockM];
   // Per-tile, per-N-atom partials for the register reduction: four lanes of a warp share a row,
   // and the MMA splits each row across kMmaAtomsN warps, so the row reduction is a shuffle plus a
   // four-entry flush through shared memory.
@@ -201,7 +200,6 @@ __global__ __launch_bounds__(kThreads) void flash_attention_device(
   for (auto row = threadId; row < kBlockM; row += kThreads) {
     sRowMax[row] = -INFINITY;
     sRowSum[row] = 0.0f;
-    sRowScale[row] = 0.0f;
   }
   __syncthreads();
 
@@ -332,6 +330,13 @@ __global__ __launch_bounds__(kThreads) void flash_attention_device(
       sTileSum[rowA][nAtom] = sumA;
       sTileSum[rowB][nAtom] = sumB;
     }
+    // The value prefetch has had the whole QK and softmax to land, so retire it before the single
+    // barrier that makes P, the sum partials and V visible together.
+    if (tile + 1 == activeTiles) {
+      cute::cp_async_wait<0>();
+    } else if (tile > 0) {
+      cute::cp_async_wait<1>();
+    }
     __syncthreads();
 
     auto sumTotalA = sTileSum[rowA][0];
@@ -348,21 +353,14 @@ __global__ __launch_bounds__(kThreads) void flash_attention_device(
       sRowMax[rowB] = newMaxB;
       sRowSum[rowA] = sRowSum[rowA] * correctionA + sumTotalA;
       sRowSum[rowB] = sRowSum[rowB] * correctionB + sumTotalB;
-      sRowScale[rowA] = correctionA;
-      sRowScale[rowB] = correctionB;
     }
 
-    if (tile + 1 == activeTiles) {
-      cute::cp_async_wait<0>();
-    } else if (tile > 0) {
-      cute::cp_async_wait<1>();
-    }
-    __syncthreads();
-
+    // Each thread still holds the correction for the two rows it owns, so rescaling O needs no
+    // shared-memory read and no extra barrier after the per-row state is stored above.
     CUTE_UNROLL
     for (auto i = 0; i < size(tOrO); ++i) {
       const auto row = static_cast<int>(cute::get<0>(tOcO(i)));
-      tOrO(i) *= sRowScale[row];
+      tOrO(i) *= row == rowA ? correctionA : correctionB;
     }
     CUTE_UNROLL
     for (auto kb = 0; kb < size<2>(tPrP); ++kb) {
