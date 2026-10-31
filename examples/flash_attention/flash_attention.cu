@@ -179,14 +179,21 @@ __global__ __launch_bounds__(kThreads) void flash_attention_device(
   auto tXrB = thrS2rB.retile_D(tCrB);  // (CPY,MMA_N,MMA_K,kTiles)
 
   // P and V are repartitioned as MMA OPERANDS. The QK accumulator is neither the correct shape
-  // nor the correct register order for this. Generic copies preserve the logical coordinates;
-  // QK's K-major ldmatrix B atom cannot simply be reused for the N-major V transpose.
+  // nor the correct register order for this. P is consumed through the generic copy (its A
+  // operand is written row-major by the softmax). V's logical B operand is the transpose of the
+  // row-major V staging, which is exactly what ldmatrix.trans reads: SM75_U16x4_LDSM_T turns the
+  // 16 32-bit shared loads per thread per tile into four transposed ldmatrix instructions.
   const Tensor tPsP = thrMma.partition_A(sP);
   const Tensor tVsVt = thrMma.partition_B(sVt);
   Tensor tPrP = thrMma.partition_fragment_A(sP);
   Tensor tVrV = thrMma.partition_fragment_B(sVt);
   static_assert(size(tPsP) == size(tPrP));
   static_assert(size(tVsVt) == size(tVrV));
+  const auto s2rAtomVT = Copy_Atom<cute::SM75_U16x4_LDSM_T, half_t>{};
+  const auto s2rCopyVT = make_tiled_copy_B(s2rAtomVT, tiledMma);
+  const auto thrS2rVT = s2rCopyVT.get_slice(threadIdx.x);
+  auto tXsVT = thrS2rVT.partition_S(sVt); // (CPY,MMA_N,MMA_K)
+  auto tXrVT = thrS2rVT.retile_D(tVrV);   // (CPY,MMA_N,MMA_K)
 
   const auto warpId = threadId / 32;
   const auto laneId = threadId % 32;
@@ -365,7 +372,7 @@ __global__ __launch_bounds__(kThreads) void flash_attention_device(
     CUTE_UNROLL
     for (auto kb = 0; kb < size<2>(tPrP); ++kb) {
       cute::copy(tPsP(_, _, kb), tPrP(_, _, kb));
-      cute::copy(tVsVt(_, _, kb), tVrV(_, _, kb));
+      cute::copy(s2rAtomVT, tXsVT(_, _, kb), tXrVT(_, _, kb));
       cute::gemm(tiledMma, tPrP(_, _, kb), tVrV(_, _, kb), tOrO);
     }
     // Every warp must finish consuming P/V before another tile overwrites their shared buffers.

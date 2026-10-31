@@ -96,8 +96,9 @@ evaluated on the accumulator fragment, and the resulting unnormalized fp16
 probabilities are written straight into a row-major P tile that PV consumes as
 MMA operand A. Physical row-major `V(key, feature)` is exposed as the logical
 MMA B operand `B(feature, key)` using its actual transposed layout, stride
-`(1, k)`. Shared-to-register PV copies are generic CuTe copies, rather than
-reusing the K-major QK `ldmatrix` load atom for a differently oriented operand.
+`(1, k)`; that transpose is what `ldmatrix.trans` reads natively, so V is
+fetched with CuTe's `SM75_U16x4_LDSM_T` atom instead of elementwise loads. P is
+still moved by a generic copy, since its A operand is written row-major.
 Every output fragment element's row is obtained through the MMA's
 identity-tensor partition for rescaling and final normalization.
 
