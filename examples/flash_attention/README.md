@@ -41,6 +41,18 @@ masks/bias, public log-sum-exp output and backward are not included.
   are single buffers that a `cp.async` prefetch refills for tile `t + 1` while
   tile `t`'s softmax and PV run. Fully future causal tiles are skipped
   CTA-uniformly; partial tiles are masked row-by-row.
+- **`flash_attention_tma` — the same kernel with TMA key tiles.** Tiling,
+  softmax, PV and V prefetch are identical; only the key stream differs, using
+  `cp.async.bulk.tensor.2d` with an `mbarrier` and a single producer thread
+  instead of `cp.async`. Three things this variant has to get right, all checked
+  on an RTX 5060 / CUDA 13.3: the `CUtensorMap` descriptor must live at a
+  64-byte aligned address, a by-value kernel parameter only guarantees natural
+  alignment; TMA evaluates its 128-byte swizzle on the *shared-window* address,
+  so the destination must be 1024-byte aligned (eight 128-byte rows) or the tile
+  lands rotated; and the shared key layout must be the 8x64 row-major swizzle
+  atom, not `fused_softmax_mainloop.cuh`'s 8x8-blocked one. It verifies
+  identically to `flash_attention` and measures within noise of it (0.92x-1.17x
+  depending on shape), so it documents the technique rather than a speedup.
 - **`flash_attention_naive` — plain CUDA correctness floor.** A CTA owns one
   query row, computes the visible scores using SIMT arithmetic, performs stable
   softmax in FP32, and multiplies by V without tensor cores. It does not allocate
@@ -126,6 +138,7 @@ unstable relative errors near zero. Nonfinite output fails verification.
 | implementation | constraint |
 |---|---|
 | `flash_attention` | `m % 32 = 0`, `n % 64 = 0`, `k = 64` or `128` |
+| `flash_attention_tma` | same shape and stride constraints as `flash_attention`; extra dynamic shared memory for the 1024-byte key-tile alignment |
 | `flash_attention` input strides | Q/K/V leading dimensions divisible by 8 and row pointers 16-byte aligned; all leading dimensions at least `k` |
 | `flash_attention_naive` | `k + n <= 12272`, including query/score rows and warp reductions within 48 KiB shared memory |
 | `cublas_unfused_attention` | positive dimensions and valid row-major leading dimensions |

@@ -22,6 +22,7 @@
 #include "cublas_unfused_attention.cuh"
 #include "flash_attention.cuh"
 #include "flash_attention_naive.cuh"
+#include "flash_attention_tma.cuh"
 #include "flash_attention_upstream.cuh"
 #include "reference.cuh"
 
@@ -74,15 +75,16 @@ struct Impl {
   AttentionFn run;
 };
 
-constexpr size_t kImplCount = 4;
+constexpr size_t kImplCount = 5;
 constexpr array<Impl, kImplCount> kImpls{{
     Impl{"flash_attention_naive", flash_attention_naive},
     Impl{"cublas_unfused_attention", cublas_unfused_attention},
     Impl{"flash_attention", flash_attention},
+    Impl{"flash_attention_tma", flash_attention_tma},
     Impl{"flash_attention_upstream", flash_attention_upstream},
 }};
 constexpr size_t kBaselineIndex = 1;
-constexpr size_t kFlashAttentionIndex = 3;
+constexpr size_t kFlashAttentionIndex = 4;
 
 struct Problem {
   int m = 0;
