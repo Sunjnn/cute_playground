@@ -231,8 +231,29 @@ target_include_directories(playground_flash_attention_upstream_kernels PRIVATE
                            "${_fa_src}" "${_fa_cutlass}/include")
 target_include_directories(playground_flash_attention_upstream_kernels SYSTEM PRIVATE
                            ${TORCH_INCLUDE_DIRS})
-target_link_libraries(playground_flash_attention_upstream_kernels PRIVATE
-                      ${TORCH_LIBRARIES} ${_fa_c10_cuda} CUDA::cudart)
+# Link only c10/c10_cuda instead of every LibTorch library. The forward path
+# needs Torch headers plus c10_cuda's error checks; torch_cuda.dll is never
+# called. On Windows this keeps the runtime CUDA dependency to cudart only.
+option(PLAYGROUND_FA_LINK_MINIMAL_TORCH
+       "Link only c10/c10_cuda for the upstream FA2 kernels (not all of LibTorch)" OFF)
+if(PLAYGROUND_FA_LINK_MINIMAL_TORCH)
+  if(TARGET c10)
+    set(_fa_c10 c10)
+  else()
+    find_library(FLASH_ATTENTION_C10_LIBRARY NAMES c10
+                 PATHS "${TORCH_INSTALL_PREFIX}/lib" NO_DEFAULT_PATH)
+    if(NOT FLASH_ATTENTION_C10_LIBRARY)
+      message(FATAL_ERROR "Cannot find the c10 library for PLAYGROUND_FA_LINK_MINIMAL_TORCH")
+    endif()
+    set(_fa_c10 "${FLASH_ATTENTION_C10_LIBRARY}")
+    mark_as_advanced(FLASH_ATTENTION_C10_LIBRARY)
+  endif()
+  target_link_libraries(playground_flash_attention_upstream_kernels PRIVATE
+                        ${_fa_c10_cuda} ${_fa_c10} CUDA::cudart)
+else()
+  target_link_libraries(playground_flash_attention_upstream_kernels PRIVATE
+                        ${TORCH_LIBRARIES} ${_fa_c10_cuda} CUDA::cudart)
+endif()
 
 # Apply exported Torch ABI definitions to both nvcc passes, and forward any
 # host-only options with -Xcompiler. TORCH_CXX_FLAGS may be absent on platforms
@@ -253,6 +274,18 @@ set(_fa_cuda_flags -O3 --expt-relaxed-constexpr --expt-extended-lambda --use_fas
                    -U__CUDA_NO_HALF2_OPERATORS__ -U__CUDA_NO_BFLOAT16_CONVERSIONS__)
 target_compile_options(playground_flash_attention_upstream_kernels PRIVATE
                        "$<$<COMPILE_LANGUAGE:CUDA>:${_fa_cuda_flags}>")
+# MSVC reports __cplusplus as 199711L unless /Zc:__cplusplus is enabled. CUTLASS
+# gates its C++17 platform traits on that macro, so the nvcc host pass otherwise
+# cannot find cutlass::platform::is_unsigned_v (and friends).
+if(MSVC)
+  target_compile_options(playground_flash_attention_upstream_kernels PRIVATE
+                         "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:__cplusplus>")
+endif()
+# CUTLASS 4.0's cuda_host_adapter.hpp marks a template that calls a host-only
+# virtual as __host__ __device__; CMake's --Werror cross-execution-space-call
+# turns that diagnostic into a hard error. Suppress only that diagnostic.
+target_compile_options(playground_flash_attention_upstream_kernels PRIVATE
+                       "$<$<COMPILE_LANGUAGE:CUDA>:-Xcudafe;--diag_suppress=20011>")
 # Only dense, full/causal fp16 D=64/128 forward attention is dispatched by the
 # bridge. Pruning these branches is safe for that deliberately narrow contract.
 target_compile_definitions(playground_flash_attention_upstream_kernels PRIVATE
