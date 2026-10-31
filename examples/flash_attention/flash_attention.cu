@@ -13,6 +13,8 @@
 using cute::_;
 using cute::_1;
 using cute::Copy_Atom;
+using cute::cp_async_fence;
+using cute::cp_async_wait;
 using cute::half_t;
 using cute::Int;
 using cute::Layout;
@@ -30,14 +32,13 @@ using cute::make_tiled_mma;
 using cute::Shape;
 using cute::size;
 using cute::SM80_16x8x16_F32F16F16F32_TN;
+using cute::SM80_CP_ASYNC_CACHEALWAYS;
 using cute::Step;
 using cute::Stride;
 using cute::Tensor;
 using cute::Tile;
 using cute::uint128_t;
-using cute::UniversalCopy;
 using cute::X;
-using fused_softmax::compute_tile;
 using fused_softmax::kBlockK;
 using fused_softmax::kBlockM;
 using fused_softmax::kMmaAtomsM;
@@ -53,78 +54,22 @@ using std::runtime_error;
 namespace {
 
 constexpr int kBlockN = 64;
-constexpr int kWarps = kThreads / 32;
 
-// No buffers alias in this first version. Q/K staging is reused across head-dimension tiles,
-// while S, P and V remain distinct until PV has consumed them. Even k = 128 fits below 48 KB.
+// No score staging: the QK accumulator stays in registers and the online softmax reduces it there
+// (see the loop). Q is staged once for the CTA; K and V are single buffers overwritten by the next
+// tile as soon as the current one has consumed them, with cp.async prefetch overlapping the
+// transfer with the softmax and PV that run in between.
 template <int kHeadDim> constexpr std::size_t smem_bytes() {
-  return ((static_cast<std::size_t>(kBlockM) + kBlockN) * kBlockK +
+  constexpr std::size_t kKTiles = kHeadDim / kBlockK;
+  return ((static_cast<std::size_t>(kBlockM) * kBlockK * kKTiles) +
+          (static_cast<std::size_t>(kBlockN) * kBlockK * kKTiles) +
           static_cast<std::size_t>(kBlockM) * kBlockN +
           static_cast<std::size_t>(kBlockN) * kHeadDim) *
-             sizeof(half_t) +
-         static_cast<std::size_t>(kBlockM) * kBlockN * sizeof(float);
+         sizeof(half_t);
 }
 
-static_assert(smem_bytes<128>() + 3ULL * kBlockM * sizeof(float) <= 48ULL * 1024);
-
-// A warp owns a logical row here, independently of the MMA's fragment layout. This staging costs
-// an extra shared-memory round trip, but keeps the online recurrence and PV operand conversion
-// visible without assuming that a QK output fragment can also be used as a PV input fragment.
-__device__ void update_softmax(
-    const float *scores,
-    half_t *probs,
-    float *rowMax,
-    float *rowSum,
-    float *rowScale,
-    int rowBase,
-    int colBase,
-    int m,
-    int n,
-    float scale,
-    bool causal) {
-  const auto warpId = static_cast<int>(threadIdx.x) / 32;
-  const auto laneId = static_cast<int>(threadIdx.x) % 32;
-  for (auto row = warpId; row < kBlockM; row += kWarps) {
-    float values[kBlockN / 32];
-    auto tileMax = -INFINITY;
-    CUTE_UNROLL
-    for (auto c = 0; c < kBlockN / 32; ++c) {
-      const auto col = laneId + c * 32;
-      auto value = scores[row * kBlockN + col] * scale;
-      if (causal && colBase + col > rowBase + row + n - m) {
-        value = -INFINITY;
-      }
-      values[c] = value;
-      tileMax = fmaxf(tileMax, value);
-    }
-#pragma unroll
-    for (auto offset = 16; offset > 0; offset /= 2) {
-      tileMax = fmaxf(tileMax, __shfl_xor_sync(0xffffffffu, tileMax, offset));
-    }
-
-    const auto oldMax = rowMax[row];
-    const auto newMax = fmaxf(oldMax, tileMax);
-    // An empty tile contributes no probabilities. An empty old state contributes no numerator;
-    // neither needs the undefined exp(-inf - -inf). Causal m <= n makes the first tile nonempty.
-    const auto correction = oldMax == -INFINITY ? 0.0f : __expf(oldMax - newMax);
-    auto tileSum = 0.0f;
-    CUTE_UNROLL
-    for (auto c = 0; c < kBlockN / 32; ++c) {
-      const auto value = values[c] == -INFINITY ? 0.0f : __expf(values[c] - newMax);
-      tileSum += value;
-      probs[row * kBlockN + laneId + c * 32] = half_t(value);
-    }
-#pragma unroll
-    for (auto offset = 16; offset > 0; offset /= 2) {
-      tileSum += __shfl_xor_sync(0xffffffffu, tileSum, offset);
-    }
-    if (laneId == 0) {
-      rowMax[row] = newMax;
-      rowSum[row] = correction * rowSum[row] + tileSum;
-      rowScale[row] = correction;
-    }
-  }
-}
+static_assert(smem_bytes<128>() <= 48ULL * 1024,
+              "the register-softmax tile should stay under the default shared-memory limit");
 
 template <int kHeadDim>
 __global__ __launch_bounds__(kThreads) void flash_attention_device(
@@ -140,10 +85,16 @@ __global__ __launch_bounds__(kThreads) void flash_attention_device(
     int n,
     float scale,
     bool causal) {
+  constexpr int kKTiles = kHeadDim / kBlockK;
   extern __shared__ __align__(16) char sRaw[];
   __shared__ float sRowMax[kBlockM];
   __shared__ float sRowSum[kBlockM];
   __shared__ float sRowScale[kBlockM];
+  // Per-tile, per-N-atom partials for the register reduction: four lanes of a warp share a row,
+  // and the MMA splits each row across kMmaAtomsN warps, so the row reduction is a shuffle plus a
+  // four-entry flush through shared memory.
+  __shared__ float sTileMax[kBlockM][kMmaAtomsN];
+  __shared__ float sTileSum[kBlockM][kMmaAtomsN];
 
   const auto bM = Int<kBlockM>{};
   const auto bN = Int<kBlockN>{};
@@ -169,13 +120,11 @@ __global__ __launch_bounds__(kThreads) void flash_attention_device(
   Tensor gO = local_tile(mO, make_shape(bM, bD), make_coord(rowBlock, 0));
 
   auto *sQPtr = reinterpret_cast<half_t *>(sRaw);
-  auto *sKPtr = sQPtr + static_cast<std::size_t>(kBlockM) * kBlockK;
-  auto *sPPtr = sKPtr + static_cast<std::size_t>(kBlockN) * kBlockK;
+  auto *sKPtr = sQPtr + static_cast<std::size_t>(kBlockM) * kBlockK * kKTiles;
+  auto *sPPtr = sKPtr + static_cast<std::size_t>(kBlockN) * kBlockK * kKTiles;
   auto *sVPtr = sPPtr + static_cast<std::size_t>(kBlockM) * kBlockN;
-  auto *sScoresPtr =
-      reinterpret_cast<float *>(sVPtr + static_cast<std::size_t>(kBlockN) * kHeadDim);
-  const Tensor sQ = make_tensor(make_smem_ptr(sQPtr), make_k_major_smem_layout(bM, bK));
-  const Tensor sK = make_tensor(make_smem_ptr(sKPtr), make_k_major_smem_layout(bN, bK));
+  const Tensor sQ = make_tensor(make_smem_ptr(sQPtr), make_k_major_smem_layout<kKTiles>(bM, bK));
+  const Tensor sK = make_tensor(make_smem_ptr(sKPtr), make_k_major_smem_layout<kKTiles>(bN, bK));
   const Tensor sP =
       make_tensor(make_smem_ptr(sPPtr), make_layout(make_shape(bM, bN), make_stride(bN, _1{})));
   const Tensor sV =
@@ -185,11 +134,11 @@ __global__ __launch_bounds__(kThreads) void flash_attention_device(
   // V is deliberately unswizzled here, so stride (1, kHeadDim) is precisely that transpose.
   const Tensor sVt =
       make_tensor(make_smem_ptr(sVPtr), make_layout(make_shape(bD, bN), make_stride(_1{}, bD)));
-  Tensor sScores = make_tensor(
-      make_smem_ptr(sScoresPtr), make_layout(make_shape(bM, bN), make_stride(bN, _1{})));
 
+  // cp.async, not UniversalCopy: the key/value prefetches issued between phases only overlap if
+  // the copy does not block the issuing warp.
   auto tiledCopy = make_tiled_copy(
-      Copy_Atom<UniversalCopy<uint128_t>, half_t>{},
+      Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, half_t>{},
       Layout<Shape<Int<32>, Int<8>>, Stride<Int<8>, Int<1>>>{},
       Layout<Shape<Int<1>, Int<8>>>{});
   auto tiledMma = make_tiled_mma(
@@ -198,13 +147,37 @@ __global__ __launch_bounds__(kThreads) void flash_attention_device(
       Tile<Int<kMmaM>, Int<kMmaN>, Int<kMmaK>>{});
   const auto thrMma = tiledMma.get_slice(threadIdx.x);
   const auto thrCopy = decltype(tiledCopy)::get_slice(threadIdx.x);
+  const Tensor tAgA = thrCopy.partition_S(gQ); // (CPY,CPY_M,CPY_K,kTiles)
+  const Tensor tAsQ = thrCopy.partition_D(sQ); // (CPY,CPY_M,CPY_K,kTiles)
+  const Tensor tBsK = thrCopy.partition_D(sK); // (CPY,CPY_N,CPY_K,kTiles)
   const Tensor tVgV = thrCopy.partition_S(gV);
   Tensor tVsV = thrCopy.partition_D(sV);
-  Tensor tSsS = thrMma.partition_C(sScores);
-  Tensor tSrS = thrMma.partition_fragment_C(sScores);
   Tensor tOrO = thrMma.partition_fragment_C(gO);
   Tensor tOgO = thrMma.partition_C(gO);
   const Tensor tOcO = thrMma.partition_C(make_identity_tensor(make_shape(bM, bD)));
+
+  // The score accumulator is registers only. It is partitioned from a coordinate tensor, so the
+  // C-layout (and therefore the row/column mapping below) is exactly the MMA's; the pointer is
+  // never dereferenced.
+  const Tensor tCcS = thrMma.partition_C(make_identity_tensor(make_shape(bM, bN)));
+  Tensor tSrS = thrMma.partition_fragment_C(
+      make_tensor(make_smem_ptr(reinterpret_cast<float *>(sRaw)),
+                  make_layout(make_shape(bM, bN), make_stride(bN, _1{}))));
+
+  // Q and K are partitioned over the whole head dimension with the stage mode kept, so the QK
+  // mainloop is one uninterrupted run of ldmatrix + MMA per key tile.
+  auto tCrA = thrMma.partition_fragment_A(sQ); // (MMA,MMA_M,MMA_K,kTiles)
+  auto tCrB = thrMma.partition_fragment_B(sK); // (MMA,MMA_N,MMA_K,kTiles)
+  const auto s2rAtomA = Copy_Atom<cute::SM75_U32x4_LDSM_N, half_t>{};
+  const auto s2rAtomB = Copy_Atom<cute::SM75_U32x2_LDSM_N, half_t>{};
+  const auto s2rCopyA = make_tiled_copy_A(s2rAtomA, tiledMma);
+  const auto s2rCopyB = make_tiled_copy_B(s2rAtomB, tiledMma);
+  const auto thrS2rA = s2rCopyA.get_slice(threadIdx.x);
+  const auto thrS2rB = s2rCopyB.get_slice(threadIdx.x);
+  auto tXsA = thrS2rA.partition_S(sQ); // (CPY,MMA_M,MMA_K,kTiles)
+  auto tXsB = thrS2rB.partition_S(sK); // (CPY,MMA_N,MMA_K,kTiles)
+  auto tXrA = thrS2rA.retile_D(tCrA);  // (CPY,MMA_M,MMA_K,kTiles)
+  auto tXrB = thrS2rB.retile_D(tCrB);  // (CPY,MMA_N,MMA_K,kTiles)
 
   // P and V are repartitioned as MMA OPERANDS. The QK accumulator is neither the correct shape
   // nor the correct register order for this. Generic copies preserve the logical coordinates;
@@ -216,6 +189,14 @@ __global__ __launch_bounds__(kThreads) void flash_attention_device(
   static_assert(size(tPsP) == size(tPrP));
   static_assert(size(tVsVt) == size(tVrV));
 
+  const auto warpId = threadId / 32;
+  const auto laneId = threadId % 32;
+  const auto nAtom = warpId / kMmaAtomsM;
+  // The two rows this thread owns in the C fragment: element 0 is the first row, element 2 (after
+  // the two adjacent columns of the first) the second.
+  const auto rowA = static_cast<int>(cute::get<0>(tCcS(0)));
+  const auto rowB = static_cast<int>(cute::get<0>(tCcS(2)));
+
   cute::clear(tOrO);
   for (auto row = threadId; row < kBlockM; row += kThreads) {
     sRowMax[row] = -INFINITY;
@@ -225,28 +206,157 @@ __global__ __launch_bounds__(kThreads) void flash_attention_device(
   __syncthreads();
 
   const int nTiles = size<2>(gK);
-  const int kTiles = size<2>(gQ);
   const auto lastVisible = causal ? rowBase + kBlockM - 1 + n - m : n - 1;
   const auto activeTiles = min(nTiles, lastVisible / kBlockN + 1);
+
+  // Prime the pipeline: Q, key tile 0 and value tile 0 in one commit group.
+  CUTE_UNROLL
+  for (auto kt = 0; kt < kKTiles; ++kt) {
+    cute::copy(tiledCopy, tAgA(_, _, _, kt), tAsQ(_, _, _, kt));
+  }
+  {
+    const auto tBgFirst = thrCopy.partition_S(gK(_, _, 0, _));
+    CUTE_UNROLL
+    for (auto kt = 0; kt < kKTiles; ++kt) {
+      cute::copy(tiledCopy, tBgFirst(_, _, _, kt), tBsK(_, _, _, kt));
+    }
+  }
+  cute::copy(tiledCopy, tVgV(_, _, _, 0), tVsV);
+  cute::cp_async_fence();
+
+  // Group retirement schedule (two groups can be in flight):
+  //   start of tile t : K(t) landed, V(t) may still be in flight -> wait<1> (t > 0)
+  //   before PV of t  : V(t) landed, K(t + 1) may stay in flight -> wait<1>
+  // Tile 0 starts from the single priming group, the last tile waits for everything.
   for (auto tile = 0; tile < activeTiles; ++tile) {
-    // Only the TEMPORARY score fragment is cleared by compute_tile. O stays alive across tiles.
-    compute_tile(tiledCopy, tiledMma, gQ, sQ, gK(_, _, tile, _), sK, tSrS, kTiles);
-    cute::copy(tSrS, tSsS);
-    cute::copy(tiledCopy, tVgV(_, _, _, tile), tVsV);
+    if (tile == 0) {
+      cute::cp_async_wait<0>();
+    } else {
+      cute::cp_async_wait<1>();
+    }
     __syncthreads();
 
-    update_softmax(
-        sScoresPtr,
-        sPPtr,
-        sRowMax,
-        sRowSum,
-        sRowScale,
-        rowBase,
-        tile * kBlockN,
-        m,
-        n,
-        scale,
-        causal);
+    cute::clear(tSrS);
+    CUTE_UNROLL
+    for (auto kt = 0; kt < kKTiles; ++kt) {
+      CUTE_UNROLL
+      for (auto kb = 0; kb < size<2>(tCrA); ++kb) {
+        cute::copy(s2rAtomA, tXsA(_, _, kb, kt), tXrA(_, _, kb, kt));
+        cute::copy(s2rAtomB, tXsB(_, _, kb, kt), tXrB(_, _, kb, kt));
+        cute::gemm(tiledMma, tCrA(_, _, kb, kt), tCrB(_, _, kb, kt), tSrS);
+      }
+    }
+
+    // ---- online softmax straight from the accumulator, no 8 KB score staging ----
+    // Scale and mask in place, reducing each thread's rows to a per-warp maximum.
+    auto maxA = -INFINITY;
+    auto maxB = -INFINITY;
+    CUTE_UNROLL
+    for (auto i = 0; i < size(tSrS); ++i) {
+      const auto row = static_cast<int>(cute::get<0>(tCcS(i)));
+      auto value = tSrS(i) * scale;
+      if (causal && tile * kBlockN + static_cast<int>(cute::get<1>(tCcS(i))) > rowBase + row + n - m) {
+        value = -INFINITY;
+      }
+      tSrS(i) = value;
+      if (row == rowA) {
+        maxA = fmaxf(maxA, value);
+      } else {
+        maxB = fmaxf(maxB, value);
+      }
+    }
+#pragma unroll
+    for (auto offset = 1; offset < 4; offset *= 2) {
+      maxA = fmaxf(maxA, __shfl_xor_sync(0xffffffffu, maxA, offset));
+      maxB = fmaxf(maxB, __shfl_xor_sync(0xffffffffu, maxB, offset));
+    }
+    if (laneId % 4 == 0) {
+      sTileMax[rowA][nAtom] = maxA;
+      sTileMax[rowB][nAtom] = maxB;
+    }
+    // This barrier also proves every warp has finished reading sK, so the prefetch may overwrite it.
+    __syncthreads();
+
+    if (tile + 1 < activeTiles) {
+      const auto tBgNext = thrCopy.partition_S(gK(_, _, tile + 1, _));
+      CUTE_UNROLL
+      for (auto kt = 0; kt < kKTiles; ++kt) {
+        cute::copy(tiledCopy, tBgNext(_, _, _, kt), tBsK(_, _, _, kt));
+      }
+      cute::cp_async_fence();
+    }
+
+    // Combine the four N-atom partials and fold in the running maximum.
+    auto tileMaxA = sTileMax[rowA][0];
+    auto tileMaxB = sTileMax[rowB][0];
+    CUTE_UNROLL
+    for (auto part = 1; part < kMmaAtomsN; ++part) {
+      tileMaxA = fmaxf(tileMaxA, sTileMax[rowA][part]);
+      tileMaxB = fmaxf(tileMaxB, sTileMax[rowB][part]);
+    }
+    const auto oldMaxA = sRowMax[rowA];
+    const auto oldMaxB = sRowMax[rowB];
+    const auto newMaxA = fmaxf(oldMaxA, tileMaxA);
+    const auto newMaxB = fmaxf(oldMaxB, tileMaxB);
+    // An empty tile contributes no probabilities. An empty old state contributes no numerator;
+    // neither needs the undefined exp(-inf - -inf). Causal m <= n makes the first tile nonempty.
+    const auto correctionA = oldMaxA == -INFINITY ? 0.0f : __expf(oldMaxA - newMaxA);
+    const auto correctionB = oldMaxB == -INFINITY ? 0.0f : __expf(oldMaxB - newMaxB);
+
+    // Exponentiate, stage fp16 probabilities in shared memory (PV's A operand) and sum per row.
+    auto sumA = 0.0f;
+    auto sumB = 0.0f;
+    CUTE_UNROLL
+    for (auto i = 0; i < size(tSrS); i += 2) {
+      const auto row = static_cast<int>(cute::get<0>(tCcS(i)));
+      const auto col = static_cast<int>(cute::get<1>(tCcS(i)));
+      const auto newMax = row == rowA ? newMaxA : newMaxB;
+      const auto p0 = tSrS(i) == -INFINITY ? 0.0f : __expf(tSrS(i) - newMax);
+      const auto p1 = tSrS(i + 1) == -INFINITY ? 0.0f : __expf(tSrS(i + 1) - newMax);
+      tSrS(i) = p0;
+      tSrS(i + 1) = p1;
+      if (row == rowA) {
+        sumA += p0 + p1;
+      } else {
+        sumB += p0 + p1;
+      }
+      // The two elements of an MMA atom are adjacent columns of one row.
+      *reinterpret_cast<__half2 *>(sPPtr + row * kBlockN + col) = __floats2half2_rn(p0, p1);
+    }
+#pragma unroll
+    for (auto offset = 1; offset < 4; offset *= 2) {
+      sumA += __shfl_xor_sync(0xffffffffu, sumA, offset);
+      sumB += __shfl_xor_sync(0xffffffffu, sumB, offset);
+    }
+    if (laneId % 4 == 0) {
+      sTileSum[rowA][nAtom] = sumA;
+      sTileSum[rowB][nAtom] = sumB;
+    }
+    __syncthreads();
+
+    auto sumTotalA = sTileSum[rowA][0];
+    auto sumTotalB = sTileSum[rowB][0];
+    CUTE_UNROLL
+    for (auto part = 1; part < kMmaAtomsN; ++part) {
+      sumTotalA += sTileSum[rowA][part];
+      sumTotalB += sTileSum[rowB][part];
+    }
+    // Only one N atom per row writes the state; the other three would store identical values but
+    // race on the read-modify-write of rowSum.
+    if (nAtom == 0 && laneId % 4 == 0) {
+      sRowMax[rowA] = newMaxA;
+      sRowMax[rowB] = newMaxB;
+      sRowSum[rowA] = sRowSum[rowA] * correctionA + sumTotalA;
+      sRowSum[rowB] = sRowSum[rowB] * correctionB + sumTotalB;
+      sRowScale[rowA] = correctionA;
+      sRowScale[rowB] = correctionB;
+    }
+
+    if (tile + 1 == activeTiles) {
+      cute::cp_async_wait<0>();
+    } else if (tile > 0) {
+      cute::cp_async_wait<1>();
+    }
     __syncthreads();
 
     CUTE_UNROLL
@@ -262,6 +372,11 @@ __global__ __launch_bounds__(kThreads) void flash_attention_device(
     }
     // Every warp must finish consuming P/V before another tile overwrites their shared buffers.
     __syncthreads();
+
+    if (tile + 1 < activeTiles) {
+      cute::copy(tiledCopy, tVgV(_, _, _, tile + 1), tVsV);
+      cute::cp_async_fence();
+    }
   }
 
   CUTE_UNROLL
@@ -285,7 +400,8 @@ void launch_attention(
     int ldO,
     float scale,
     bool causal) {
-  flash_attention_device<kHeadDim><<<m / kBlockM, kThreads, smem_bytes<kHeadDim>()>>>(
+  constexpr auto kSmemBytes = smem_bytes<kHeadDim>();
+  flash_attention_device<kHeadDim><<<m / kBlockM, kThreads, kSmemBytes>>>(
       dQ, ldQ, dK, ldK, dV, ldV, dO, ldO, m, n, scale, causal);
 }
 

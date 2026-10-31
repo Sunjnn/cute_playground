@@ -29,14 +29,18 @@ masks/bias, public log-sum-exp output and backward are not included.
 
 - **`flash_attention` — this repo's fused CuTe kernel.** One CTA owns 32 query
   rows and streams the keys/values in 64-row tiles. The SM80 `16x8x16` fp16/fp32
-  MMA configuration and swizzled Q/K mainloop are reused from
+  MMA configuration and swizzled Q/K shared layouts come from
   `fused_softmax_mainloop.cuh`; the instructions also run on the project's
-  sm_120 target. QK produces only a tile of scores, not a global score matrix.
-  A warp-per-row reduction updates online softmax statistics and stages
-  unnormalized fp16 probabilities. A second MMA multiplies these by V, keeping
-  the output numerator in FP32 registers across key tiles. O is normalized and
-  stored once at the end. Fully future causal tiles are skipped CTA-uniformly;
-  partial tiles are masked row-by-row.
+  sm_120 target. QK produces only a tile of scores, not a global score matrix,
+  and those scores never leave registers: the online max/sum reduction runs on
+  the accumulator fragment itself (four-lane shuffles, then a four-entry flush
+  through shared memory for the N-atom split), and only the unnormalized fp16
+  probabilities are staged for the second MMA. A second MMA multiplies these by
+  V, keeping the output numerator in FP32 registers across key tiles. O is
+  normalized and stored once at the end. Q is staged once per CTA, while K and V
+  are single buffers that a `cp.async` prefetch refills for tile `t + 1` while
+  tile `t`'s softmax and PV run. Fully future causal tiles are skipped
+  CTA-uniformly; partial tiles are masked row-by-row.
 - **`flash_attention_naive` — plain CUDA correctness floor.** A CTA owns one
   query row, computes the visible scores using SIMT arithmetic, performs stable
   softmax in FP32, and multiplies by V without tensor cores. It does not allocate
@@ -81,26 +85,29 @@ Rescaling **both** `l` and every feature of `u` is essential when a later tile
 raises the maximum. The empty initial state uses `alpha=0`; masked scores
 produce exactly zero probability without evaluating `exp(-inf - -inf)`.
 Unlike `fused_softmax_recompute`, this visits each KV tile once and never writes
-a global S or P. Each visit still loops over head-dimension tiles for QK; this
-version does not retain all of Q in registers.
+a global S or P. Each visit still loops over head-dimension tiles for QK; Q lives
+in shared memory, not in registers.
 
 ### Layout and precision choices
 
-QK's output fragment is **not** PV's input fragment. Scores are staged in
-FP32 shared memory, probabilities converted into a separate row-major fp16 P
-tile, and then partitioned as MMA operand A. Physical row-major
-`V(key, feature)` is exposed as the logical MMA B operand
-`B(feature, key)` using its actual transposed layout, stride `(1, k)`.
-Shared-to-register PV copies are generic CuTe copies, rather than reusing the
-K-major QK `ldmatrix` load atom for a differently oriented operand. Every output
-fragment element's row is obtained through the MMA's identity-tensor partition
-for rescaling and final normalization.
+QK's output fragment is **not** PV's input fragment, but no score tile is ever
+written to shared memory: the online maximum, exponentiation and row sum are
+evaluated on the accumulator fragment, and the resulting unnormalized fp16
+probabilities are written straight into a row-major P tile that PV consumes as
+MMA operand A. Physical row-major `V(key, feature)` is exposed as the logical
+MMA B operand `B(feature, key)` using its actual transposed layout, stride
+`(1, k)`. Shared-to-register PV copies are generic CuTe copies, rather than
+reusing the K-major QK `ldmatrix` load atom for a differently oriented operand.
+Every output fragment element's row is obtained through the MMA's
+identity-tensor partition for rescaling and final normalization.
 
-Q/K staging, S, P and V occupy distinct shared buffers with explicit barriers
-between production, consumption and reuse. Dynamic shared memory is 32 KiB at
-`k=64` and 40 KiB at `k=128`, plus 384 bytes of row statistics. There is no
-multi-stage `cp.async` pipeline, buffer aliasing or register-only softmax in this
-first version; these are optimization opportunities, not claimed speedups.
+Q is staged once per CTA because its head dimension is invariant across key
+tiles; K and V are single buffers, and P is a third. A `cp.async` prefetch
+refills K and V for tile `t + 1` immediately after tile `t` has consumed them, so
+the transfer overlaps the softmax and PV in between. There is no multi-stage ring
+and no buffer aliasing. Dynamic shared memory is 24 KiB at `k=64` and 44 KiB at
+`k=128`, plus 384 bytes of row statistics and 1 KiB of per-tile reduction
+partials.
 
 Both matrix multiplications and the online statistics/output numerator use
 FP32 accumulation. The fused kernel casts **unnormalized** p to fp16 for PV but
