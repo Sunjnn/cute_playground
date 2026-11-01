@@ -275,6 +275,18 @@ barriers, the online softmax arithmetic, and staging the fp16 probabilities for
 PV. Causal cases also skip their future tiles, which is why they report a lower
 dense-equivalent rate than the full non-causal cases.
 
+Every implementation synchronizes once per call, and that launch-and-synchronize
+round trip costs about **21 us**: a 32 x 64 x 64 case, whose kernel is a few
+microseconds, measures 22 us. The table reports raw calls, so the floor is
+included in every row and this is what limits the small shapes, not the CTA
+count alone. Removing the floor from the four rows gives roughly 46%, 56%, 61%
+and 67% of the measured peak for 2048, 4096 causal, 4096 non-causal and 8192.
+The same floor is why a key-range split of the causal row blocks was rejected:
+measured with events, splitting 512 rows into four key slices made the attention
+kernel 16 us instead of 10 us, and the second launch plus the merge added about
+another 20 us. The causal imbalance a split would fix is real, but on this GPU a
+second kernel costs more than the imbalance.
+
 ## Verification cases
 
 On a CUDA machine, run small square and rectangular cases for both masks and
