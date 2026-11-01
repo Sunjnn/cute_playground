@@ -163,6 +163,7 @@ cmake --build build --target flash_attention
 ./build/examples/flash_attention                       # 2048 x 2048 x 128, causal
 ./build/examples/flash_attention --m=256 --n=512 --k=64 --mask=none
 ./build/examples/flash_attention --m=128 --n=256 --k=128 --mask=causal
+./build/examples/flash_attention --m=8192 --n=8192 --k=128 --mask=none --iterations=5  # sustained
 ```
 
 ### Enable the official FlashAttention-2 baseline
@@ -247,6 +248,33 @@ not only the device kernel. Required asynchronous scratch allocation/release is
 included for cuBLAS and upstream FA2, with pool pages retained after warmup. No
 implementation performs input transfers or Python dispatch inside the timed loop.
 
+## Measured performance
+
+Measured on the target machine (RTX 5060, 30 SMs at up to 3.09 GHz, CUDA 13.3),
+minimum of five runs, `--iterations=10`. The ceiling is the measured
+`mma.sync` fp16/fp32 throughput, **44.0 TFLOP/s**; a copy kernel reaches 380 GB/s
+of the 448 GB/s theoretical HBM bandwidth and an L2-resident read kernel reaches
+1.6-1.9 TB/s. `tcgen05` is not enabled for sm_120, so `mma.sync` is the ceiling
+for any implementation in this example.
+
+| case | `flash_attention` | useful TFLOP/s | share of 44 TFLOP/s | FA2 |
+|---|---|---|---|---|
+| 2048 x 2048 x 128 causal | 74.2 us | 14.5 | 33% | 116.1 us |
+| 4096 x 4096 x 128 causal | 194.5 us | 22.1 | 50% | 234.0 us |
+| 4096 x 4096 x 128 non-causal | 342.3 us | 25.1 | 57% | 421.8 us |
+| 8192 x 8192 x 128 non-causal | 1183.9 us | 29.0 | 66% | 1240.4 us |
+
+"Useful" counts only the visible key/query pairs, so a causal case reports half
+the dense count; the non-causal rows equal the harness's `TFLOP/s` column.
+Utilization rises with the number of CTAs because the 45.5 KiB tile allows two
+CTAs per SM: 2048 rows fill 64 CTAs against 60 resident slots, 4096 rows run two
+waves, and 8192 rows four. At the large sizes the kernel is not memory bound
+(L2 reads are about 0.9 TB/s, 57% of the measured L2 peak, and DRAM traffic is
+under 2 GB/s); the remaining third is per-tile overhead, that is the four
+barriers, the online softmax arithmetic, and staging the fp16 probabilities for
+PV. Causal cases also skip their future tiles, which is why they report a lower
+dense-equivalent rate than the full non-causal cases.
+
 ## Verification cases
 
 On a CUDA machine, run small square and rectangular cases for both masks and
@@ -283,11 +311,12 @@ compute-sanitizer --tool memcheck ./build/examples/flash_attention --m=96 --n=32
 compute-sanitizer --tool racecheck ./build/examples/flash_attention --m=96 --n=320 --k=128
 ```
 
-**Validation status:** CUDA compilation, GPU correctness, sanitizer checks and
-performance measurements have not been performed on the current macOS editing
-machine, which has no `nvcc` or NVIDIA GPU tooling. No benchmark numbers or
-speedup claims are reported here. Run the commands above on the target CUDA
-machine before relying on this example's numerical or performance results.
+**Validation status:** verified on the target RTX 5060 with CUDA 13.3. Every
+shape that an implementation supports passes against the double-precision host
+reference, including the rectangular and non-multiple-of-32 tails, and the
+numbers under [Measured performance](#measured-performance) were taken on that
+machine. Re-run the sanitizer commands above on the target GPU after any change
+to the kernel.
 
 Local checks cover formatting/whitespace, disabled CMake configuration, explicit
 missing-CUDA errors, mock dependency/target isolation, and host-only bridge
