@@ -221,7 +221,7 @@ __global__ __launch_bounds__(kThreads) void flash_attention_device(
   const auto lastVisible = causal ? rowBase + kBlockM - 1 + n - m : n - 1;
   const auto activeTiles = min(nTiles, lastVisible / kBlockN + 1);
 
-  // Prime the pipeline: Q, key tile 0 and value tile 0 in one commit group.
+  // Prime the pipeline with Q and key tile 0; the value tile is issued inside the loop instead.
   CUTE_UNROLL
   for (auto kt = 0; kt < kKTiles; ++kt) {
     cute::copy(tiledCopy, tAgA(_, _, _, kt), tAsQ(_, _, _, kt));
@@ -233,20 +233,19 @@ __global__ __launch_bounds__(kThreads) void flash_attention_device(
       cute::copy(tiledCopy, tBgFirst(_, _, _, kt), tBsK(_, _, _, kt));
     }
   }
-  cute::copy(tiledCopy, tVgV(_, _, _, 0), tVsV);
   cute::cp_async_fence();
 
-  // Group retirement schedule (two groups can be in flight):
-  //   start of tile t : K(t) landed, V(t) may still be in flight -> wait<1> (t > 0)
-  //   before PV of t  : V(t) landed, K(t + 1) may stay in flight -> wait<1>
-  // Tile 0 starts from the single priming group, the last tile waits for everything.
+  // Group retirement schedule:
+  //   start of tile t : every group retired, so Q and K(t) are in shared and the value buffer is
+  //                    free -- the barrier that proves all warps finished PV(t - 1) is this one,
+  //                    which is why the tile no longer ends with its own barrier. V(t) is issued
+  //                    here and only has to land before PV.
+  //   before PV of t  : V(t) landed, the K(t + 1) prefetch may stay in flight -> wait<1>
   for (auto tile = 0; tile < activeTiles; ++tile) {
-    if (tile == 0) {
-      cute::cp_async_wait<0>();
-    } else {
-      cute::cp_async_wait<1>();
-    }
+    cute::cp_async_wait<0>();
     __syncthreads();
+    cute::copy(tiledCopy, tVgV(_, _, _, tile), tVsV);
+    cute::cp_async_fence();
 
     cute::clear(tSrS);
     CUTE_UNROLL
@@ -345,12 +344,12 @@ __global__ __launch_bounds__(kThreads) void flash_attention_device(
       sTileSum[rowA][nAtom] = sumA;
       sTileSum[rowB][nAtom] = sumB;
     }
-    // The value prefetch has had the whole QK and softmax to land, so retire it before the single
-    // barrier that makes P, the sum partials and V visible together.
-    if (tile + 1 == activeTiles) {
-      cute::cp_async_wait<0>();
-    } else if (tile > 0) {
+    // V(t) was issued at the top of this tile, so retire it here; the K(t + 1) prefetch may stay
+    // in flight. This barrier also publishes P and the sum partials.
+    if (tile + 1 < activeTiles) {
       cute::cp_async_wait<1>();
+    } else {
+      cute::cp_async_wait<0>();
     }
     __syncthreads();
 
@@ -382,13 +381,6 @@ __global__ __launch_bounds__(kThreads) void flash_attention_device(
       cute::copy(tPsP(_, _, kb), tPrP(_, _, kb));
       cute::copy(s2rAtomVT, tXsVT(_, _, kb), tXrVT(_, _, kb));
       cute::gemm(tiledMma, tPrP(_, _, kb), tVrV(_, _, kb), tOrO);
-    }
-    // Every warp must finish consuming P/V before another tile overwrites their shared buffers.
-    __syncthreads();
-
-    if (tile + 1 < activeTiles) {
-      cute::copy(tiledCopy, tVgV(_, _, _, tile + 1), tVsV);
-      cute::cp_async_fence();
     }
   }
 

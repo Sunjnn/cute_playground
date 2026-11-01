@@ -38,9 +38,11 @@ masks/bias, public log-sum-exp output and backward are not included.
   probabilities are staged for the second MMA. A second MMA multiplies these by
   V, keeping the output numerator in FP32 registers across key tiles. O is
   normalized and stored once at the end. Q is staged once per CTA, while K and V
-  are single buffers that a `cp.async` prefetch refills for tile `t + 1` while
-  tile `t`'s softmax and PV run. Fully future causal tiles are skipped
-  CTA-uniformly; partial tiles are masked row-by-row.
+  are single buffers: the key prefetch for tile `t + 1` is issued as soon as the
+  QK of tile `t` has consumed the buffer, and the value tile `t` is issued at the
+  top of tile `t` -- after the barrier that proves every warp finished PV of
+  `t - 1` -- so a tile needs three barriers, not four. Fully future causal tiles
+  are skipped CTA-uniformly; partial tiles are masked row-by-row.
 - **`flash_attention_tma` — the same kernel with TMA key tiles.** Tiling,
   softmax, PV and V prefetch are identical; only the key stream differs, using
   `cp.async.bulk.tensor.2d` with an `mbarrier` and a single producer thread
@@ -259,10 +261,10 @@ for any implementation in this example.
 
 | case | `flash_attention` | useful TFLOP/s | share of 44 TFLOP/s | FA2 |
 |---|---|---|---|---|
-| 2048 x 2048 x 128 causal | 74.2 us | 14.5 | 33% | 116.1 us |
-| 4096 x 4096 x 128 causal | 194.5 us | 22.1 | 50% | 234.0 us |
-| 4096 x 4096 x 128 non-causal | 342.3 us | 25.1 | 57% | 421.8 us |
-| 8192 x 8192 x 128 non-causal | 1183.9 us | 29.0 | 66% | 1240.4 us |
+| 2048 x 2048 x 128 causal | 71.3 us | 15.1 | 34% | 115.6 us |
+| 4096 x 4096 x 128 causal | 189.7 us | 22.6 | 51% | 232.6 us |
+| 4096 x 4096 x 128 non-causal | 332.9 us | 25.8 | 59% | 422.7 us |
+| 8192 x 8192 x 128 non-causal | 1152.4 us | 29.8 | 68% | 1240.4 us |
 
 "Useful" counts only the visible key/query pairs, so a causal case reports half
 the dense count; the non-causal rows equal the harness's `TFLOP/s` column.
@@ -270,7 +272,7 @@ Utilization rises with the number of CTAs because the 45.5 KiB tile allows two
 CTAs per SM: 2048 rows fill 64 CTAs against 60 resident slots, 4096 rows run two
 waves, and 8192 rows four. At the large sizes the kernel is not memory bound
 (L2 reads are about 0.9 TB/s, 57% of the measured L2 peak, and DRAM traffic is
-under 2 GB/s); the remaining third is per-tile overhead, that is the four
+under 2 GB/s); the remaining third is per-tile overhead, that is the three
 barriers, the online softmax arithmetic, and staging the fp16 probabilities for
 PV. Causal cases also skip their future tiles, which is why they report a lower
 dense-equivalent rate than the full non-causal cases.
@@ -279,8 +281,8 @@ Every implementation synchronizes once per call, and that launch-and-synchronize
 round trip costs about **21 us**: a 32 x 64 x 64 case, whose kernel is a few
 microseconds, measures 22 us. The table reports raw calls, so the floor is
 included in every row and this is what limits the small shapes, not the CTA
-count alone. Removing the floor from the four rows gives roughly 46%, 56%, 61%
-and 67% of the measured peak for 2048, 4096 causal, 4096 non-causal and 8192.
+count alone. Removing the floor from the four rows gives roughly 48%, 58%, 63%
+and 69% of the measured peak for 2048, 4096 causal, 4096 non-causal and 8192.
 The same floor is why a key-range split of the causal row blocks was rejected:
 measured with events, splitting 512 rows into four key slices made the attention
 kernel 16 us instead of 10 us, and the second launch plus the merge added about
